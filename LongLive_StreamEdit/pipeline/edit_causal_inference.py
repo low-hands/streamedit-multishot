@@ -45,6 +45,11 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
         self.kv_cache1 = None
         self.args = args
+        # ✨ optional lower temporal-noise correlation inside editing regions;
+        # None keeps the original uniform correlation
+        self.noise_alpha_fg = getattr(args, "noise_alpha_fg", None)
+        # ✨ optional directory for per-chunk mask dumps (looking, not measuring)
+        self.dump_masks_dir = getattr(args, "dump_masks_dir", None)
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = args.model_kwargs.local_attn_size
 
@@ -264,10 +269,12 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
         # Step 3: Temporal denoising loop
         denoising_step_list = self.denoising_step_list
+        _dump_chunk_idx = -1
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if independent_first_frame and trg_initial_latent is None:
             all_num_frames = [1] + all_num_frames
         for current_num_frames in tqdm(all_num_frames):
+            _dump_chunk_idx += 1
             if profile:
                 block_start.record()
 
@@ -283,7 +290,11 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
             # obtain currently inprocessed kv_cache for dual branch
             shared_dict_dual = dict()
+            self._kv_cache_to(kv_cache_trg, 'cuda', low_memory)
             kv_cache_dual = self._concat_kv_cache(kv_cache_src, kv_cache_trg, shared_dict=shared_dict_dual)
+            # the dual cache now holds a copy of the target cache, so the target cache
+            # can be offloaded for the whole spatial denoising loop (the memory peak)
+            self._kv_cache_to(kv_cache_trg, 'cpu', low_memory)
 
             #✨ forward clean source video to get source mask, and store into kv_cache
             self._register_crossattn_mask_gatherer(crossattn_cache_src, tok_src, layers=mask_layers, fg_scale=fg_scale)
@@ -378,6 +389,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
                         crossattn_cache_dual, size=(current_num_frames, height, width), scale_factor=16
                     )
                     inloop_trg_fg_mask_bin = inloop_src_trg_fg_mask_bin.chunk(2, dim=0)[1]
+                    self._dump_masks(_dump_chunk_idx, src_map=src_fg_mask_map,
+                                     vis_bin=mask_bin_vis, vis_soft=mask_soft_vis)
                     # inject union of origin src and in-processing trg masks to kv_cache
                     inloop_trg_fg_mask = inloop_trg_fg_mask_bin | src_fg_mask_bin
                     self._inject_masks_to_kv_cache(
@@ -493,6 +506,42 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 except Exception:
                     pass
 
+
+    def _dump_masks(self, chunk_idx, src_map=None, vis_bin=None, vis_soft=None):
+        '''
+        ✨ Write the masks this chunk actually used to self.dump_masks_dir.
+        Nothing here is recomputed: mask_soft_vis / mask_bin_vis are already
+        produced (at full 480x832) by _aggregate_crossattn_mask and were
+        previously discarded. Row order in vis_* is [src, trg].
+        '''
+        d = getattr(self, "dump_masks_dir", None)
+        if not d:
+            return
+        import numpy as np
+        from PIL import Image
+        os.makedirs(d, exist_ok=True)
+
+        def save(arr, name):
+            a = arr.detach().float().cpu().numpy()
+            a = (a - a.min()) / (a.max() - a.min() + 1e-8) if a.max() > a.min() else a * 0
+            for f in range(a.shape[0]):
+                Image.fromarray((a[f] * 255).astype("uint8")).save(
+                    os.path.join(d, "c%03d_f%d_%s.png" % (chunk_idx, f, name)))
+
+        if src_map is not None:                       # M^src, the reliable floor
+            m = src_map[0]
+            if m.shape[-1] < 400:                     # latent res -> video res
+                m = F.interpolate(m.float().unsqueeze(0), scale_factor=16,
+                                  mode="nearest").squeeze(0) > 0.5
+            save(m, "Msrc")
+        if vis_bin is not None:                       # [2B, F, H, W] = [src, trg]
+            save(vis_bin[0], "bin_src")
+            if vis_bin.shape[0] > 1:
+                save(vis_bin[1], "bin_trg")
+        if vis_soft is not None:
+            save(vis_soft[0], "soft_src")
+            if vis_soft.shape[0] > 1:
+                save(vis_soft[1], "soft_trg")
 
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override: int | None = None):
         """
@@ -620,23 +669,13 @@ class EditCausalInferencePipeline(torch.nn.Module):
             index_kvc = kvc_1
         for b_idx in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.cat((kvc_1[b_idx]["k"], kvc_2[b_idx]["k"]), dim=0).clone(),
-                "v": torch.cat((kvc_1[b_idx]["v"], kvc_2[b_idx]["v"]), dim=0).clone(),
+                "k": torch.cat((kvc_1[b_idx]["k"], kvc_2[b_idx]["k"]), dim=0),
+                "v": torch.cat((kvc_1[b_idx]["v"], kvc_2[b_idx]["v"]), dim=0),
                 "global_end_index": index_kvc[b_idx]["global_end_index"].clone(),
                 "local_end_index": index_kvc[b_idx]["local_end_index"].clone(),
                 "shared_dict": shared_dict,
             })
         return kv_cache1
-
-    def _append_clean_src_kv_cache(self, kvc_dual, kvc_src):
-        '''
-        ✨ add clean src kv cache to dual cache dict
-        '''
-        for b_idx in range(self.num_transformer_blocks):
-            kvc_dual[b_idx].update({
-                'k_src_clean': kvc_src[b_idx]['k'],
-                'v_src_clean': kvc_src[b_idx]['v'],
-            })
 
     def _inject_masks_to_kv_cache(
         self, kv_cache, 
@@ -654,12 +693,17 @@ class EditCausalInferencePipeline(torch.nn.Module):
             })
     
     def _kv_cache_to(self, kvc, device, low_memory):
+        '''
+        ✨ Offload the target KV cache while the dual cache already holds a copy.
+        Only "k"/"v" are moved: the bookkeeping tensors stay put so the surrounding
+        .item() calls keep working regardless of the offload state.
+        '''
         if not low_memory:
             return
         for itm in kvc:
-            for k, v in itm.items():
-                if isinstance(v, torch.Tensor):
-                    v.to(device)
+            for key in ("k", "v"):
+                if isinstance(itm.get(key, None), torch.Tensor):
+                    itm[key] = itm[key].to(device)
         
         
     def _register_crossattn_enhancement(self, crossattn_cache, fg_indices, fg_boost_factor=1.0, layers=range(30), current_src_fg_mask=None):
@@ -736,24 +780,43 @@ class EditCausalInferencePipeline(torch.nn.Module):
     ):
         if reuse_noise_temporal_mean:
             self.noise_temporal_mean = dict()
-            self.noise_temporal_mean_fg = dict()
-            self.noise_temporal_mean_bg = dict()
         else:
             self.noise_temporal_mean = None
-            self.noise_temporal_mean_fg = None
-            self.noise_temporal_mean_bg = None
 
     def _reuse_noise_statistics(
-        self, noise: torch.Tensor, step_idx: int, 
-        fg_mask=None,
-        alpha_prog=2, 
+        self, noise: torch.Tensor, step_idx: int,
+        fg_mask=None, alpha_prog=2,
     ):
-        if self.noise_temporal_mean is not None:
-            if step_idx not in self.noise_temporal_mean.keys():
-                self.noise_temporal_mean[step_idx] = noise
-            else:
-                noise = self.noise_temporal_mean[step_idx].flip(1) * alpha_prog / (1 + alpha_prog ** 2) ** 0.5 + \
-                    noise * 1 / (1 + alpha_prog ** 2) ** 0.5
-                self.noise_temporal_mean[step_idx] = noise
+        '''
+        ✨ Temporally correlated noise across chunks. alpha_prog sets the correlation
+        with the previous chunk's noise (alpha=2 -> corr 2/sqrt(5) ~= 0.894).
 
+        When self.noise_alpha_fg is set and fg_mask is given, editing regions use that
+        (lower) correlation instead, so randomness is preserved where the edit needs it
+        (cf. Sec. 4.4: "randomness in editing-related regions remains beneficial").
+        Leaving self.noise_alpha_fg as None reproduces the original uniform behaviour.
+
+        noise:   [B, F, C, H, W]
+        fg_mask: [B, F, H, W] bool
+        '''
+        if self.noise_temporal_mean is None:
+            return noise
+        if step_idx not in self.noise_temporal_mean.keys():
+            self.noise_temporal_mean[step_idx] = noise
+            return noise
+
+        prev = self.noise_temporal_mean[step_idx].flip(1)
+
+        def _mix(alpha):
+            scale = (1 + alpha ** 2) ** 0.5
+            return prev * alpha / scale + noise / scale
+
+        noise = _mix(alpha_prog)
+
+        alpha_fg = getattr(self, "noise_alpha_fg", None)
+        if (alpha_fg is not None) and (fg_mask is not None):
+            m = fg_mask.unsqueeze(2).to(noise.dtype)            # [B, F, 1, H, W]
+            noise = noise * (1 - m) + _mix(alpha_fg) * m
+
+        self.noise_temporal_mean[step_idx] = noise
         return noise

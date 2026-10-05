@@ -41,6 +41,8 @@ def load_pipe(args):
     config = OmegaConf.load(args.config_path)
     config['model_kwargs']['timestep_shift'] = args.flow_shift
     config['denoising_step_list'] = np.arange(1000, 0, -1000 / args.step).astype(int).tolist()
+    config['noise_alpha_fg'] = args.noise_alpha_fg
+    config['dump_masks_dir'] = args.dump_masks_dir
     # infinity relative rope
     config['model_kwargs']['use_infinite_attention'] = getattr(args, 'use_infinite_attention', False)
 
@@ -162,6 +164,12 @@ if __name__ == '__main__':
     # hyper-parameters
     parser.add_argument("--fg_boost_factor", type=float, default=2.0, help='CrossAttn Boosting')
     parser.add_argument("--blend_power", type=float, default=2.0, help='rho')
+    parser.add_argument("--dump_masks_dir", type=str, default=None,
+                        help='write per-chunk cross-attention masks here (PNG)')
+    parser.add_argument("--noise_alpha_fg", type=float, default=None,
+                        help='temporal-noise correlation inside editing regions; '
+                             'None (default) keeps the original uniform correlation, '
+                             '0 fully decorrelates the foreground across chunks')
 
     # model settings
     parser.add_argument("--step", type=int, default=15, help='1~1000')
