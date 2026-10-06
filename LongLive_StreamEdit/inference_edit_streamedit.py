@@ -189,6 +189,8 @@ def build_parser():
     parser.add_argument("--oracle_mask", type=str, default=None,
                         help="E0: npz with `masks` bool [T,H,W] (source video) replacing cross-attn grounding")
     parser.add_argument("--oracle_dilate", type=int, default=1, help="token dilation radius for --oracle_mask")
+    parser.add_argument("--oracle_dilate_mode", choices=["plain", "nogap"], default="plain",
+                        help="v1 dilation: plain, or nogap = do not fill gaps between mask parts (see patch_nogap.py)")
     parser.add_argument("--oracle_lat_dilate", type=int, default=1, help="v1: latent-cell dilation of the SOG mask")
     parser.add_argument("--edit_mem", type=int, default=0,
                         help="edit memory size in tokens per layer (0 = off), see patch_edit_mem.py")
@@ -313,12 +315,23 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
             _px = torch.stack([(_m[_s:_s + _n][g].mean(0) >= 0.5).float() for g in _g])   # majority over frames
             _lat = _pool.avg_pool2d(_px[:, None], 8)[:, 0] >= 0.5                        # [L, 60, 104]
             _tok = _pool.avg_pool2d(_lat.float()[:, None], 2)[:, 0] >= 0.5               # [L, 30, 52]
+            def _grow(x, r):  # dilate by r cells; nogap: skip cells a closing with radius r would fill
+                f = x.float()[:, None]
+                d = _pool.max_pool2d(f, 2 * r + 1, 1, r)
+                if args.oracle_dilate_mode == "nogap":
+                    c = -_pool.max_pool2d(-d, 2 * r + 1, 1, r)          # closing = erode(dilate)
+                    d = d * (1 - ((c > 0) & (f == 0)).float())
+                return d[:, 0] > 0
+            _lat0 = _lat
             if args.oracle_dilate > 0:
-                _r = args.oracle_dilate
-                _tok = _pool.max_pool2d(_tok.float()[:, None], 2 * _r + 1, 1, _r)[:, 0] > 0
+                _tok = _grow(_tok, args.oracle_dilate)
+                if args.oracle_dilate_mode == "nogap":  # gaps seen at latent resolution, in token units
+                    _r2 = 2 * args.oracle_dilate
+                    _d2 = _pool.max_pool2d(_lat0.float()[:, None], 2 * _r2 + 1, 1, _r2)
+                    _gap = ((-_pool.max_pool2d(-_d2, 2 * _r2 + 1, 1, _r2)) > 0)[:, 0] & ~_lat0
+                    _tok = _tok & ~(_pool.avg_pool2d(_gap.float()[:, None], 2)[:, 0] > 0.5)
             if args.oracle_lat_dilate > 0:  # SOG mask: +N latent cells (default 1)
-                _r = args.oracle_lat_dilate
-                _lat = _pool.max_pool2d(_lat.float()[:, None], 2 * _r + 1, 1, _r)[:, 0] > 0
+                _lat = _grow(_lat, args.oracle_lat_dilate)
             if args.oracle_invert:
                 _tok, _lat = ~_tok, ~_lat
             _toks.append(_tok.reshape(len(_g), -1)); _lats.append(_lat)
