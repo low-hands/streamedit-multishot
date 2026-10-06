@@ -4,6 +4,7 @@ import os
 from pathlib import Path 
 
 import json
+import time
 from collections import OrderedDict
 from omegaconf import OmegaConf
 import peft
@@ -194,6 +195,10 @@ def build_parser():
                         help="attention-side mask with --oracle_mask: SAM3 only, or SAM3 OR target cross-attn")
     parser.add_argument("--sog_mask", choices=["velocity", "gate", "replace", "union"], default="velocity",
                         help="SOG foreground: stock velocity gap, oracle-gated velocity gap, or the oracle mask")
+    parser.add_argument("--timing_out", type=str, default=None, help="json with encode/diffusion/decode timings")
+    parser.add_argument("--viz_out", type=str, default=None, help=".pt with SOG/attention masks and x0 frames")
+    parser.add_argument("--viz_x0_chunks", type=str, default="", help="chunks whose one-step x0 is decoded")
+    parser.add_argument("--viz_x0_steps", type=str, default="0,6,7,14", help="0-based denoising steps for x0")
     parser.add_argument("--save_latents", type=str, default=None, help="optional .pt path for output latents")
     parser.add_argument("--force_low_memory", choices=["on", "off"], default=None,
                         help="Override the free-VRAM < 40 GB heuristic. Unset = stock behaviour.")
@@ -249,6 +254,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
     ])
 
     # AE
+    torch.cuda.synchronize(); _t_enc0 = time.perf_counter()
     src_video_tensor = torch.stack([transform(img) for img in src_video], dim=1).unsqueeze(0)
     if shot_frames:  # ✨ E0: one VAE encode per shot -> no causal-conv context crosses a cut
         parts, _s = [], 0
@@ -269,6 +275,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         ).to(device=device, dtype=torch.bfloat16)
         shot_latents, cut_chunks = None, None
 
+    torch.cuda.synchronize(); _t_enc = time.perf_counter() - _t_enc0
     oracle_token_masks = None
     if args.oracle_mask:
         assert shot_frames, "--oracle_mask needs --shot_frames (latent/frame mapping restarts per shot)"
@@ -310,14 +317,15 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
     # Clear VAE cache
     pipeline.vae.model.clear_cache()
 
+    torch.cuda.synchronize(); _t_inf0 = time.perf_counter()
     edit_video = pipeline.inference(
         src_video=video_latents,
         src_prompts=args.src_prompt,
         trg_prompts=args.trg_prompt,
         src_trigger_words=args.src_word,
         trg_trigger_words=args.trg_word,
-        return_latents=bool(shot_frames),
-        wo_video_decode=bool(shot_frames),
+        return_latents=True,
+        wo_video_decode=True,
         profile=False,
         low_memory=low_memory,
 
@@ -333,18 +341,53 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         oracle_token_masks=oracle_token_masks,
         sog_mask=args.sog_mask,
         oracle_attn=args.oracle_attn,
+        viz=bool(args.viz_out),
+        viz_x0_chunks=[int(x) for x in args.viz_x0_chunks.split(",") if x],
+        viz_x0_steps=[int(x) for x in args.viz_x0_steps.split(",") if x],
     )
-    if shot_frames:  # ✨ E0: decode every shot separately as well
-        _, out_latents = edit_video
-        if args.save_latents:
-            torch.save(out_latents.cpu(), args.save_latents)
-        vids, _s = [], 0
-        for _l in shot_latents:
+    torch.cuda.synchronize(); _t_inf = time.perf_counter() - _t_inf0
+    _, out_latents = edit_video
+    if args.save_latents:
+        torch.save(out_latents.cpu(), args.save_latents)
+    # ✨ E0: per-shot decode; without --shot_frames one segment = the stock joint decode
+    _segs = shot_latents if shot_frames else [out_latents.shape[1]]
+    torch.cuda.synchronize(); _t_dec0 = time.perf_counter()
+    vids, _s = [], 0
+    for _l in _segs:
+        pipeline.vae.model.clear_cache()
+        _v = pipeline.vae.decode_to_pixel(out_latents[:, _s:_s + _l], use_cache=False)
+        vids.append((_v * 0.5 + 0.5).clamp(0, 1))
+        _s += _l
+    edit_video = torch.cat(vids, dim=1)
+    torch.cuda.synchronize(); _t_dec = time.perf_counter() - _t_dec0
+    _tm = getattr(pipeline, "timing", None) or {}
+    timing = {"frames": int(edit_video.shape[1]), "encode_s": _t_enc, "inference_s": _t_inf,
+              "diffusion_s": sum(_tm.get("chunk_ms", [])) / 1e3, "chunk_ms": _tm.get("chunk_ms", []),
+              "viz_overhead_s": _tm.get("viz_ms", 0.0) / 1e3, "decode_s": _t_dec}
+    timing["total_s"] = _t_enc + _t_inf - timing["viz_overhead_s"] + _t_dec
+    timing["s_per_frame"] = timing["total_s"] / timing["frames"]
+    print("TIMING", json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
+                               for k, v in timing.items() if k != "chunk_ms"}))
+    if args.timing_out:
+        json.dump(timing, open(args.timing_out, "w"), indent=1)
+    if args.viz_out and getattr(pipeline, "viz", None) is not None:
+        V = pipeline.viz
+        _seg_start = np.concatenate([[0], np.cumsum(_segs)[:-1]]).astype(int)
+        x0_frames = {}
+        for (c, st), lat in V["x0"].items():
+            a = int(_seg_start[np.searchsorted(_seg_start, 3 * c, side="right") - 1])
+            L = out_latents[:, a:3 * c + 3].clone()
+            L[:, 3 * c - a:] = lat.unsqueeze(0).to(L)
             pipeline.vae.model.clear_cache()
-            _v = pipeline.vae.decode_to_pixel(out_latents[:, _s:_s + _l], use_cache=False)
-            vids.append((_v * 0.5 + 0.5).clamp(0, 1))
-            _s += _l
-        edit_video = torch.cat(vids, dim=1)
+            fr = ((pipeline.vae.decode_to_pixel(L, use_cache=False)[0] * 0.5 + 0.5).clamp(0, 1) * 255).byte().cpu()
+            n_chunk = 9 if 3 * c == a else 12
+            fr = fr[-n_chunk:].permute(0, 2, 3, 1)
+            x0_frames[(c, st)] = fr[[0, n_chunk // 2]]
+        torch.save({"sog_fg": [torch.stack(s) for s in V["sog_fg"]],
+                    "sog_corr": [torch.stack(s) for s in V["sog_corr"]],
+                    "attn_src": V["attn_src"], "attn_tinj": V["attn_tinj"],
+                    "x0_frames": x0_frames, "seg_latents": [int(x) for x in _segs]}, args.viz_out)
+        pipeline.vae.model.clear_cache()
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()

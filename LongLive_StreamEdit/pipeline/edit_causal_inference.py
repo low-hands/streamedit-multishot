@@ -99,8 +99,15 @@ class EditCausalInferencePipeline(torch.nn.Module):
         oracle_token_masks: Optional[torch.Tensor] = None,
         sog_mask: str = "velocity",
         oracle_attn: str = "replace",
+        viz: bool = False,
+        viz_x0_chunks: Optional[Iterable] = None,
+        viz_x0_steps: Optional[Iterable] = None,
     ) -> torch.Tensor:
         assert not (independent_first_frame and triple_first_frame)
+        import time as _time
+        self.timing = {"chunk_ms": [], "viz_ms": 0.0}
+        self.viz = {"sog_fg": [], "sog_corr": [], "attn_src": [], "attn_tinj": [], "x0": {}} if viz else None
+        _viz_x0_chunks, _viz_x0_steps = set(viz_x0_chunks or []), set(viz_x0_steps or [])
 
         batch_size, num_frames, num_channels, height, width = src_video.shape
         if not independent_first_frame or (independent_first_frame and trg_initial_latent is not None):
@@ -281,6 +288,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
             all_num_frames = [1] + all_num_frames
         for current_num_frames in tqdm(all_num_frames):
             _dump_chunk_idx += 1
+            torch.cuda.synchronize(); _blk_t0 = _time.perf_counter(); _blk_viz = 0.0
+            if self.viz is not None:
+                self.viz["sog_fg"].append([]); self.viz["sog_corr"].append([])
             # ✨ E0: forget the previous shot when this chunk starts a new one
             if cut_chunks is not None and _dump_chunk_idx in cut_chunks and reset_at_cut != "none":
                 if reset_at_cut == "all":
@@ -324,6 +334,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 _a = current_start_frame - num_input_frames
                 src_fg_mask_bin = oracle_token_masks[_a:_a + current_num_frames].reshape(1, -1).to(
                     src_fg_mask_bin.device).expand_as(src_fg_mask_bin).clone()
+            if self.viz is not None:
+                self.viz["attn_src"].append(src_fg_mask_bin[0].detach().reshape(
+                    current_num_frames, height // 2, width // 2).cpu())
             # inject to kv_cache
             self._inject_masks_to_kv_cache(
                 kv_cache_dual, trg_fg_mask_cache, src_fg_mask_bin,
@@ -420,6 +433,14 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 bg_mask = 1 - fg_mask
                 v_t = v_trg + bg_mask * (v_gt - v_src)
                 denoised_pred = noisy_pred_input - t_i * v_t
+                if self.viz is not None:
+                    torch.cuda.synchronize(); _v0 = _time.perf_counter()
+                    self.viz["sog_fg"][-1].append(fg_mask.expand(-1, -1, 1, -1, -1)[0, :, 0].detach().half().cpu())
+                    self.viz["sog_corr"][-1].append(
+                        (t_i * bg_mask * (v_gt - v_src)).abs().mean(dim=2)[0].detach().half().cpu())
+                    if _dump_chunk_idx in _viz_x0_chunks and index in _viz_x0_steps:
+                        self.viz["x0"][(_dump_chunk_idx, index)] = denoised_pred[0].detach().cpu()
+                    torch.cuda.synchronize(); _blk_viz += _time.perf_counter() - _v0
 
                 #✨ target mask grounding
                 if index == len(denoising_step_list) // 2:
@@ -432,6 +453,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
                     # inject union of origin src and in-processing trg masks to kv_cache
                     inloop_trg_fg_mask = src_fg_mask_bin if (oracle_token_masks is not None and oracle_attn == "replace") \
                         else (inloop_trg_fg_mask_bin | src_fg_mask_bin)
+                    if self.viz is not None:
+                        self.viz["attn_tinj"].append(inloop_trg_fg_mask[0].detach().reshape(
+                            current_num_frames, height // 2, width // 2).cpu())
                     self._inject_masks_to_kv_cache(
                         kv_cache_dual, trg_fg_mask_cache, inloop_trg_fg_mask, 
                     )
@@ -464,6 +488,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 block_time = block_start.elapsed_time(block_end)
                 block_times.append(block_time)
 
+            torch.cuda.synchronize()
+            self.timing["chunk_ms"].append((_time.perf_counter() - _blk_t0 - _blk_viz) * 1e3)
+            self.timing["viz_ms"] += _blk_viz * 1e3
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
 
