@@ -80,6 +80,9 @@ def load_pipe(args):
 
     print(f'Free VRAM {get_cuda_free_memory_gb(device)} GB')
     low_memory = get_cuda_free_memory_gb(device) < 40
+    if getattr(args, "force_low_memory", None) is not None:
+        low_memory = args.force_low_memory == "on"
+    print(f"low_memory={low_memory}")
 
     torch.set_grad_enabled(False)
 
@@ -178,6 +181,8 @@ if __name__ == '__main__':
 
     parser.add_argument("--config_path", type=str, default='configs/longlive_inference.yaml')
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--force_low_memory", choices=["on", "off"], default=None,
+                        help="Override the free-VRAM < 40 GB heuristic. Unset = stock behaviour.")
     args = parser.parse_args()
 
     pipeline, low_memory, device, local_rank = load_pipe(args)
