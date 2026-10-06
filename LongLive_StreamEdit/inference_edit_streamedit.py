@@ -151,7 +151,7 @@ def load_pipe(args):
     return pipeline, low_memory, device, local_rank
 
 
-if __name__ == '__main__':
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--save_path", type=str, required=True)
@@ -193,8 +193,10 @@ if __name__ == '__main__':
     parser.add_argument("--save_latents", type=str, default=None, help="optional .pt path for output latents")
     parser.add_argument("--force_low_memory", choices=["on", "off"], default=None,
                         help="Override the free-VRAM < 40 GB heuristic. Unset = stock behaviour.")
-    args = parser.parse_args()
+    return parser
 
+
+def setup(args):
     pipeline, low_memory, device, local_rank = load_pipe(args)
     # Move pipeline to appropriate dtype and device
     pipeline = pipeline.to(dtype=torch.bfloat16)
@@ -202,7 +204,10 @@ if __name__ == '__main__':
         DynamicSwapInstaller.install_model(pipeline.text_encoder, device=device)
     pipeline.generator.to(device=device)
     pipeline.vae.to(device=device)
+    return pipeline, low_memory, device, local_rank
 
+
+def edit_one(args, pipeline, low_memory, device, local_rank):
     # Create output directory (only on main process to avoid race conditions)
     if local_rank == 0:
         os.makedirs(Path(args.save_path).parent, exist_ok=True)
@@ -344,3 +349,6 @@ if __name__ == '__main__':
     )
 
 
+if __name__ == '__main__':
+    args = build_parser().parse_args()
+    edit_one(args, *setup(args))
