@@ -189,6 +189,11 @@ def build_parser():
     parser.add_argument("--oracle_mask", type=str, default=None,
                         help="E0: npz with `masks` bool [T,H,W] (source video) replacing cross-attn grounding")
     parser.add_argument("--oracle_dilate", type=int, default=1, help="token dilation radius for --oracle_mask")
+    parser.add_argument("--oracle_lat_dilate", type=int, default=1, help="v1: latent-cell dilation of the SOG mask")
+    parser.add_argument("--edit_mem", type=int, default=0,
+                        help="edit memory size in tokens per layer (0 = off), see patch_edit_mem.py")
+    parser.add_argument("--mem_delta", type=int, default=3,
+                        help="memory keys are placed this many latent frames before the current chunk")
     parser.add_argument("--oracle_version", choices=["v0", "v1"], default="v0",
                         help="pixel->latent/token conversion of --oracle_mask (see patch_mask_v1.py)")
     parser.add_argument("--oracle_invert", action="store_true", default=False,
@@ -311,7 +316,9 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
             if args.oracle_dilate > 0:
                 _r = args.oracle_dilate
                 _tok = _pool.max_pool2d(_tok.float()[:, None], 2 * _r + 1, 1, _r)[:, 0] > 0
-            _lat = _pool.max_pool2d(_lat.float()[:, None], 3, 1, 1)[:, 0] > 0           # +1 latent cell
+            if args.oracle_lat_dilate > 0:  # SOG mask: +N latent cells (default 1)
+                _r = args.oracle_lat_dilate
+                _lat = _pool.max_pool2d(_lat.float()[:, None], 2 * _r + 1, 1, _r)[:, 0] > 0
             if args.oracle_invert:
                 _tok, _lat = ~_tok, ~_lat
             _toks.append(_tok.reshape(len(_g), -1)); _lats.append(_lat)
@@ -385,6 +392,8 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         sog_mask=args.sog_mask,
         oracle_attn=args.oracle_attn,
         oracle_latent_masks=oracle_latent_masks,
+        edit_mem=args.edit_mem,
+        mem_delta=args.mem_delta,
         viz=bool(args.viz_out),
         viz_x0_chunks=[int(x) for x in args.viz_x0_chunks.split(",") if x],
         viz_x0_steps=[int(x) for x in args.viz_x0_steps.split(",") if x],

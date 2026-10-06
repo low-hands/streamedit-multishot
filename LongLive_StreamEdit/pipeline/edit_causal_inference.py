@@ -100,6 +100,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
         sog_mask: str = "velocity",
         oracle_attn: str = "replace",
         oracle_latent_masks: Optional[torch.Tensor] = None,
+        edit_mem: int = 0,
+        mem_delta: int = 3,
         viz: bool = False,
         viz_x0_chunks: Optional[Iterable] = None,
         viz_x0_steps: Optional[Iterable] = None,
@@ -284,6 +286,10 @@ class EditCausalInferencePipeline(torch.nn.Module):
         denoising_step_list = self.denoising_step_list
         _dump_chunk_idx = -1
         _pos0 = 0  # ✨ E0: first frame of the current position epoch (moves on a full reset)
+        from wan.modules import causal_model as _cm  # ✨ edit memory
+        _cm.EDIT_MEM.update(on=edit_mem > 0, write=None, read=False, cap=edit_mem, delta=mem_delta, k={}, v={}, hw={})
+        for _i, _blk in enumerate(self.generator.model.blocks):
+            _blk.self_attn.layer_idx = _i
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if independent_first_frame and trg_initial_latent is None:
             all_num_frames = [1] + all_num_frames
@@ -346,6 +352,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 src_fg_mask_bin, size=(current_num_frames, height, width)
             )
             inloop_trg_fg_mask = src_fg_mask_bin
+            _cm.EDIT_MEM["read"] = bool(_cm.EDIT_MEM["k"])
             
             # Step 3.1: Spatial denoising loop
             noisy_pred_input = None
@@ -474,6 +481,13 @@ class EditCausalInferencePipeline(torch.nn.Module):
             self._kv_cache_to(kv_cache_trg, 'cuda', low_memory)
             self._register_crossattn_mask_gatherer(crossattn_cache_trg, tok_trg, layers=mask_layers, fg_scale=fg_scale)
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
+            _cm.EDIT_MEM["read"] = False
+            if _cm.EDIT_MEM["on"] and oracle_token_masks is not None:  # ✨ edit memory: write object tokens
+                _a = current_start_frame - num_input_frames
+                _om = oracle_token_masks[_a:_a + current_num_frames].float().reshape(
+                    current_num_frames, 1, height // 2, width // 2)
+                _om = -F.max_pool2d(-_om, 3, 1, 1)  # erode 1 token: object interior only
+                _cm.EDIT_MEM["write"] = _om.reshape(-1) > 0.5
             self.generator(
                 noisy_image_or_video=denoised_pred,
                 conditional_dict=trg_conditional_dict,
@@ -482,6 +496,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 crossattn_cache=crossattn_cache_trg,
                 current_start=(current_start_frame - _pos0) * self.frame_seq_length,
             )
+            _cm.EDIT_MEM["write"] = None
             #✨ store clean target kv cache, and obtain clean target mask
             _, trg_fg_mask_bin, _, _ = self._aggregate_crossattn_mask(crossattn_cache_trg)
             current_trg_fg_mask = src_fg_mask_bin if (oracle_token_masks is not None and oracle_attn == "replace") \

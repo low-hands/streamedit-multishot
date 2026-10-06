@@ -29,6 +29,20 @@ flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
+# ✨ edit memory (see patch_edit_mem.py); configured by the pipeline
+EDIT_MEM = {"on": False, "write": None, "read": False, "cap": 0, "delta": 3,
+            "k": {}, "v": {}, "hw": {}}
+
+
+def rope_at(x, t, hw, freqs):
+    """RoPE for tokens [N, n_heads, d] at temporal position t and spatial positions hw [N, 2]."""
+    n, c = x.size(1), x.size(2) // 2
+    f = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    fr = torch.cat([f[0][t].view(1, -1).expand(len(hw), -1), f[1][hw[:, 0]], f[2][hw[:, 1]]], dim=-1)
+    xc = torch.view_as_complex(x.to(torch.float64).reshape(len(hw), n, -1, 2))
+    return torch.view_as_real(xc * fr[:, None, :]).flatten(2).type_as(x)
+
+
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
@@ -352,6 +366,18 @@ class CausalWanSelfAttention(nn.Module):
 
             if kv_cache.get("trg_fg_mask", None) is None or kv_cache.get("current_src_fg_mask", None) is None:
                 x = attention(roped_query, attn_key, attn_value)
+                _em = EDIT_MEM
+                if _em["on"] and _em["write"] is not None:  # ✨ edit memory: write
+                    _li = self.layer_idx
+                    _have = 0 if _li not in _em["k"] else len(_em["k"][_li])
+                    _m = _em["write"].to(k.device)
+                    _room = _em["cap"] - _have
+                    if _room > 0 and _m.any():
+                        _idx = torch.nonzero(_m)[:, 0][:_room]
+                        _h, _w = grid_sizes[0][1].item(), grid_sizes[0][2].item()
+                        _hw = torch.stack([(_idx % (_h * _w)) // _w, _idx % _w], -1)
+                        for _key, _new in (("k", k[0, _idx]), ("v", v[0, _idx]), ("hw", _hw)):
+                            _em[_key][_li] = _new if _li not in _em[_key] else torch.cat([_em[_key][_li], _new])
             else:
                 # init
                 src_query, trg_query = roped_query.chunk(2, dim=0)
@@ -404,6 +430,12 @@ class CausalWanSelfAttention(nn.Module):
                     b_trg_current_value = trg_current_value[b_idx]
                     b_key_list.append(b_trg_current_key)
                     b_value_list.append(b_trg_current_value)
+
+                    _em = EDIT_MEM
+                    if _em["on"] and _em["read"] and self.layer_idx in _em["k"]:  # ✨ edit memory: read
+                        _t = max(current_start_frame - _em["delta"], 0)
+                        b_key_list.append(rope_at(_em["k"][self.layer_idx], _t, _em["hw"][self.layer_idx], freqs))
+                        b_value_list.append(_em["v"][self.layer_idx])
 
                     # store and concatenate key and value
                     b_trg_key = torch.cat(b_key_list, dim=0)
