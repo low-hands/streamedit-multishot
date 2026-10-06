@@ -30,7 +30,7 @@ CONFIGS = [  # (clip, edit key, x0 chunks to decode)
 ]
 MODES = {
     "A_stock": [],
-    "B_ours_velocity": ["shot", "--sog_mask", "velocity"],
+    "B_ours_velocity_v1": ["shot", "--sog_mask", "velocity", "--oracle_version", "v1"],
     "C_ours_gate": ["shot", "--sog_mask", "gate"],
     "C_ours_gate_v1": ["shot", "--sog_mask", "gate", "--oracle_version", "v1"],
 }

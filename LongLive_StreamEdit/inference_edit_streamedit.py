@@ -286,14 +286,19 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         assert _mb.shape[0] == new_len, (_mb.shape, new_len)
         _s, _fixed = 0, 0
         for _n in shot_frames:  # causal glitch filter, restarted at every cut
-            _prev = None
+            _prev, _raw_prev, _rej_prev = None, None, False
             for _t in range(_s, _s + _n):
-                _cur = _mb[_t]
+                _raw = _mb[_t].copy()
+                _cur, _rej = _raw, False
                 if _prev is not None and _prev.sum() > 0:
-                    _iou = (_cur & _prev).sum() / max((_cur | _prev).sum(), 1)
-                    if _cur.sum() > 2 * _prev.sum() and _iou < 0.5:
-                        _mb[_t] = _prev; _cur = _prev; _fixed += 1
-                _prev = _cur
+                    _iou = (_raw & _prev).sum() / max((_raw | _prev).sum(), 1)
+                    if _raw.sum() > 2 * _prev.sum() and _iou < 0.5:
+                        _iou_raw = ((_raw & _raw_prev).sum() / max((_raw | _raw_prev).sum(), 1)
+                                    if _raw_prev is not None else 0.0)
+                        if not (_rej_prev and _iou_raw >= 0.5):  # unconfirmed jump -> glitch
+                            _cur, _rej = _prev, True
+                            _mb[_t] = _prev; _fixed += 1
+                _prev, _raw_prev, _rej_prev = _cur, _raw, _rej
             _s += _n
         _m = torch.from_numpy(_mb).float()
         _toks, _lats, _s = [], [], 0
