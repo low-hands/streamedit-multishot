@@ -189,6 +189,8 @@ def build_parser():
     parser.add_argument("--oracle_mask", type=str, default=None,
                         help="E0: npz with `masks` bool [T,H,W] (source video) replacing cross-attn grounding")
     parser.add_argument("--oracle_dilate", type=int, default=1, help="token dilation radius for --oracle_mask")
+    parser.add_argument("--oracle_version", choices=["v0", "v1"], default="v0",
+                        help="pixel->latent/token conversion of --oracle_mask (see patch_mask_v1.py)")
     parser.add_argument("--oracle_invert", action="store_true", default=False,
                         help="use the complement of the (dilated) oracle mask, e.g. background edits")
     parser.add_argument("--oracle_attn", choices=["replace", "union_trg"], default="replace",
@@ -277,7 +279,43 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
 
     torch.cuda.synchronize(); _t_enc = time.perf_counter() - _t_enc0
     oracle_token_masks = None
-    if args.oracle_mask:
+    oracle_latent_masks = None
+    if args.oracle_mask and args.oracle_version == "v1":
+        assert shot_frames, "--oracle_mask needs --shot_frames"
+        _mb = np.load(args.oracle_mask)["masks"][:new_len].astype(bool).copy()
+        assert _mb.shape[0] == new_len, (_mb.shape, new_len)
+        _s, _fixed = 0, 0
+        for _n in shot_frames:  # causal glitch filter, restarted at every cut
+            _prev = None
+            for _t in range(_s, _s + _n):
+                _cur = _mb[_t]
+                if _prev is not None and _prev.sum() > 0:
+                    _iou = (_cur & _prev).sum() / max((_cur | _prev).sum(), 1)
+                    if _cur.sum() > 2 * _prev.sum() and _iou < 0.5:
+                        _mb[_t] = _prev; _cur = _prev; _fixed += 1
+                _prev = _cur
+            _s += _n
+        _m = torch.from_numpy(_mb).float()
+        _toks, _lats, _s = [], [], 0
+        _pool = torch.nn.functional
+        for _n in shot_frames:
+            _g = [[0]] + [list(range(4 * k - 3, 4 * k + 1)) for k in range(1, (_n - 1) // 4 + 1)]
+            _px = torch.stack([(_m[_s:_s + _n][g].mean(0) >= 0.5).float() for g in _g])   # majority over frames
+            _lat = _pool.avg_pool2d(_px[:, None], 8)[:, 0] >= 0.5                        # [L, 60, 104]
+            _tok = _pool.avg_pool2d(_lat.float()[:, None], 2)[:, 0] >= 0.5               # [L, 30, 52]
+            if args.oracle_dilate > 0:
+                _r = args.oracle_dilate
+                _tok = _pool.max_pool2d(_tok.float()[:, None], 2 * _r + 1, 1, _r)[:, 0] > 0
+            _lat = _pool.max_pool2d(_lat.float()[:, None], 3, 1, 1)[:, 0] > 0           # +1 latent cell
+            if args.oracle_invert:
+                _tok, _lat = ~_tok, ~_lat
+            _toks.append(_tok.reshape(len(_g), -1)); _lats.append(_lat)
+            _s += _n
+        oracle_token_masks = torch.cat(_toks).to(device)
+        oracle_latent_masks = torch.cat(_lats).to(device)
+        print(f"E0 oracle mask v1: glitch frames fixed={_fixed} token coverage={oracle_token_masks.float().mean():.3f} "
+              f"latent coverage={oracle_latent_masks.float().mean():.3f}")
+    elif args.oracle_mask:
         assert shot_frames, "--oracle_mask needs --shot_frames (latent/frame mapping restarts per shot)"
         _m = torch.from_numpy(np.load(args.oracle_mask)["masks"][:new_len]).float()
         assert _m.shape[0] == new_len, (_m.shape, new_len)
@@ -341,6 +379,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         oracle_token_masks=oracle_token_masks,
         sog_mask=args.sog_mask,
         oracle_attn=args.oracle_attn,
+        oracle_latent_masks=oracle_latent_masks,
         viz=bool(args.viz_out),
         viz_x0_chunks=[int(x) for x in args.viz_x0_chunks.split(",") if x],
         viz_x0_steps=[int(x) for x in args.viz_x0_steps.split(",") if x],

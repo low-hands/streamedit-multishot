@@ -32,6 +32,7 @@ MODES = {
     "A_stock": [],
     "B_ours_velocity": ["shot", "--sog_mask", "velocity"],
     "C_ours_gate": ["shot", "--sog_mask", "gate"],
+    "C_ours_gate_v1": ["shot", "--sog_mask", "gate", "--oracle_version", "v1"],
 }
 
 edits = {c["clip"]: c for c in json.load(open(f"{POOL}/edits.json"))}
@@ -43,8 +44,8 @@ for clip, ek, chunks in CONFIGS:
         jobs.append((clip, ek, chunks, tag, extra, None))
 jobs.append(("468286765_89_absence_3shot_13.9s", "control", "5,9,10,14", "A_stock_nocup", [],
              " holding a green cup"))
-if ONLY:
-    jobs = [j for j in jobs if ONLY in f"{j[0]}/{j[1]}/{j[3]}"]
+if ONLY:  # comma-separated substrings of clip/edit/mode
+    jobs = [j for j in jobs if any(o in f"{j[0]}/{j[1]}/{j[3]}" for o in ONLY.split(","))]
 
 parser = ies.build_parser()
 common = ["--fg_boost_factor", "2", "--blend_power", "2", "--step", str(STEPS),
@@ -75,7 +76,9 @@ for i, (clip, ek, chunks, tag, extra, drop) in enumerate(jobs):
     if extra and extra[0] == "shot":
         npz = f"{POOL}/sam3_masks_v2/{clip}__{e['sam3_prompt'].replace(' ', '_')}.npz"
         argv += ["--shot_frames", ",".join(str(n) for n in meta["shot_frames"]), "--reset_at_cut", "none",
-                 "--oracle_mask", npz, "--oracle_dilate", "2" if e["type"] == "replacement" else "1"] + extra[1:]
+                 "--oracle_mask", npz,
+                 # v1 is edit-type agnostic (1 token everywhere); v0 keeps the old per-type dilation
+                 "--oracle_dilate", "1" if "v1" in tag else ("2" if e["type"] == "replacement" else "1")] + extra[1:]
         if e.get("sam3_invert"):
             argv.append("--oracle_invert")
     args = parser.parse_args(argv)

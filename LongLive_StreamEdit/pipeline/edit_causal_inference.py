@@ -99,6 +99,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
         oracle_token_masks: Optional[torch.Tensor] = None,
         sog_mask: str = "velocity",
         oracle_attn: str = "replace",
+        oracle_latent_masks: Optional[torch.Tensor] = None,
         viz: bool = False,
         viz_x0_chunks: Optional[Iterable] = None,
         viz_x0_steps: Optional[Iterable] = None,
@@ -412,9 +413,13 @@ class EditCausalInferencePipeline(torch.nn.Module):
                         (fg_mask.amax(dim=data_dims, keepdim=True) - fg_mask.amin(dim=data_dims, keepdim=True) + 1e-7)
                 else:  # ✨ SOG grounded on the oracle mask
                     _a = current_start_frame - num_input_frames
-                    _o = oracle_token_masks[_a:_a + current_num_frames].float().reshape(
-                        current_num_frames, 1, height // 2, width // 2)
-                    _o = F.interpolate(_o, size=(height, width), mode="nearest")
+                    if oracle_latent_masks is not None:  # v1: latent-resolution SAM3 mask
+                        _o = oracle_latent_masks[_a:_a + current_num_frames].float().reshape(
+                            current_num_frames, 1, height, width).to(fg_mask.device)
+                    else:
+                        _o = oracle_token_masks[_a:_a + current_num_frames].float().reshape(
+                            current_num_frames, 1, height // 2, width // 2)
+                        _o = F.interpolate(_o, size=(height, width), mode="nearest")
                     _o = F.avg_pool2d(_o, 3, stride=1, padding=1, count_include_pad=False)
                     _o = _o.unsqueeze(0).to(fg_mask)                       # [1, F, 1, H, W]
                     if sog_mask == "replace":
