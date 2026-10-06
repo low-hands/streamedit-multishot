@@ -98,6 +98,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
         reset_at_cut: str = "none",
         oracle_token_masks: Optional[torch.Tensor] = None,
         sog_mask: str = "velocity",
+        oracle_attn: str = "replace",
     ) -> torch.Tensor:
         assert not (independent_first_frame and triple_first_frame)
 
@@ -405,6 +406,10 @@ class EditCausalInferencePipeline(torch.nn.Module):
                     _o = _o.unsqueeze(0).to(fg_mask)                       # [1, F, 1, H, W]
                     if sog_mask == "replace":
                         fg_mask = _o.expand_as(fg_mask)
+                    elif sog_mask == "union":
+                        _v = (fg_mask - fg_mask.amin(dim=data_dims, keepdim=True)) / \
+                            (fg_mask.amax(dim=data_dims, keepdim=True) - fg_mask.amin(dim=data_dims, keepdim=True) + 1e-7)
+                        fg_mask = torch.maximum(_o.expand_as(_v), _v)
                     else:  # gate
                         _in = _o > 0.5
                         _lo = torch.where(_in, fg_mask, torch.full_like(fg_mask, float("inf"))).amin(dim=data_dims, keepdim=True)
@@ -425,7 +430,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                     self._dump_masks(_dump_chunk_idx, src_map=src_fg_mask_map,
                                      vis_bin=mask_bin_vis, vis_soft=mask_soft_vis)
                     # inject union of origin src and in-processing trg masks to kv_cache
-                    inloop_trg_fg_mask = src_fg_mask_bin if oracle_token_masks is not None \
+                    inloop_trg_fg_mask = src_fg_mask_bin if (oracle_token_masks is not None and oracle_attn == "replace") \
                         else (inloop_trg_fg_mask_bin | src_fg_mask_bin)
                     self._inject_masks_to_kv_cache(
                         kv_cache_dual, trg_fg_mask_cache, inloop_trg_fg_mask, 
@@ -448,7 +453,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
             )
             #✨ store clean target kv cache, and obtain clean target mask
             _, trg_fg_mask_bin, _, _ = self._aggregate_crossattn_mask(crossattn_cache_trg)
-            current_trg_fg_mask = src_fg_mask_bin if oracle_token_masks is not None \
+            current_trg_fg_mask = src_fg_mask_bin if (oracle_token_masks is not None and oracle_attn == "replace") \
                 else (trg_fg_mask_bin | src_fg_mask_bin)
             self._update_trg_fg_mask_cache(trg_fg_mask_cache, current_trg_fg_mask, kv_cache_trg)
             self._kv_cache_to(kv_cache_trg, 'cpu', low_memory)
