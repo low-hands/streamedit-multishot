@@ -181,6 +181,16 @@ if __name__ == '__main__':
 
     parser.add_argument("--config_path", type=str, default='configs/longlive_inference.yaml')
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--shot_frames", type=str, default=None,
+                        help="E0: comma-separated frames per shot (each 12k-3). Encodes/decodes each shot "
+                             "separately and derives the cut chunks. Unset = stock behaviour.")
+    parser.add_argument("--reset_at_cut", choices=["none", "all", "keep_sink"], default="none")
+    parser.add_argument("--oracle_mask", type=str, default=None,
+                        help="E0: npz with `masks` bool [T,H,W] (source video) replacing cross-attn grounding")
+    parser.add_argument("--oracle_dilate", type=int, default=1, help="token dilation radius for --oracle_mask")
+    parser.add_argument("--oracle_invert", action="store_true", default=False,
+                        help="use the complement of the (dilated) oracle mask, e.g. background edits")
+    parser.add_argument("--save_latents", type=str, default=None, help="optional .pt path for output latents")
     parser.add_argument("--force_low_memory", choices=["on", "off"], default=None,
                         help="Override the free-VRAM < 40 GB heuristic. Unset = stock behaviour.")
     args = parser.parse_args()
@@ -212,7 +222,13 @@ if __name__ == '__main__':
     height = src_video[0].size[1]
     width = src_video[0].size[0]
     num_frames = len(src_video)
-    new_len = find_closest_num_frame(num_frames)
+    shot_frames = [int(x) for x in args.shot_frames.split(",")] if args.shot_frames else None
+    if shot_frames:
+        assert all((n + 3) % 12 == 0 for n in shot_frames), f"each shot must be 12k-3 frames: {shot_frames}"
+        assert sum(shot_frames) <= num_frames, (sum(shot_frames), num_frames)
+        new_len = sum(shot_frames)
+    else:
+        new_len = find_closest_num_frame(num_frames)
     src_video = src_video[: new_len]
     num_frames = len(src_video)
     print(num_frames, height, width)
@@ -225,9 +241,44 @@ if __name__ == '__main__':
 
     # AE
     src_video_tensor = torch.stack([transform(img) for img in src_video], dim=1).unsqueeze(0)
-    video_latents = pipeline.vae.encode_to_latent(
-        src_video_tensor.to(device=device, dtype=torch.bfloat16)
-    ).to(device=device, dtype=torch.bfloat16)
+    if shot_frames:  # ✨ E0: one VAE encode per shot -> no causal-conv context crosses a cut
+        parts, _s = [], 0
+        for _n in shot_frames:
+            pipeline.vae.model.clear_cache()
+            parts.append(pipeline.vae.encode_to_latent(
+                src_video_tensor[:, :, _s:_s + _n].to(device=device, dtype=torch.bfloat16)
+            ).to(device=device, dtype=torch.bfloat16))
+            _s += _n
+        video_latents = torch.cat(parts, dim=1)
+        shot_latents = [p.shape[1] for p in parts]
+        assert all(l % 3 == 0 for l in shot_latents), shot_latents
+        cut_chunks = set(int(c) for c in np.cumsum(shot_latents)[:-1] // 3)
+        print(f"E0 shots: frames={shot_frames} latents={shot_latents} cut_chunks={sorted(cut_chunks)}")
+    else:
+        video_latents = pipeline.vae.encode_to_latent(
+            src_video_tensor.to(device=device, dtype=torch.bfloat16)
+        ).to(device=device, dtype=torch.bfloat16)
+        shot_latents, cut_chunks = None, None
+
+    oracle_token_masks = None
+    if args.oracle_mask:
+        assert shot_frames, "--oracle_mask needs --shot_frames (latent/frame mapping restarts per shot)"
+        _m = torch.from_numpy(np.load(args.oracle_mask)["masks"][:new_len]).float()
+        assert _m.shape[0] == new_len, (_m.shape, new_len)
+        _toks, _s = [], 0
+        for _n in shot_frames:
+            _g = [[0]] + [list(range(4 * k - 3, 4 * k + 1)) for k in range(1, (_n - 1) // 4 + 1)]
+            _lat = torch.stack([_m[_s:_s + _n][g].amax(0) for g in _g])           # [L, H, W]
+            _t = torch.nn.functional.avg_pool2d(_lat[:, None], 16)[:, 0] > 0.1   # [L, 30, 52]
+            if args.oracle_dilate > 0:
+                _r = args.oracle_dilate
+                _t = torch.nn.functional.max_pool2d(_t.float()[:, None], 2 * _r + 1, 1, _r)[:, 0] > 0
+            if args.oracle_invert:
+                _t = ~_t
+            _toks.append(_t.reshape(len(_g), -1))
+            _s += _n
+        oracle_token_masks = torch.cat(_toks).to(device)
+        print(f"E0 oracle mask: {tuple(oracle_token_masks.shape)} coverage={oracle_token_masks.float().mean():.3f}")
 
     # first frame condition
     independent_first_frame = False
@@ -256,8 +307,8 @@ if __name__ == '__main__':
         trg_prompts=args.trg_prompt,
         src_trigger_words=args.src_word,
         trg_trigger_words=args.trg_word,
-        return_latents=False,
-        wo_video_decode=False,
+        return_latents=bool(shot_frames),
+        wo_video_decode=bool(shot_frames),
         profile=False,
         low_memory=low_memory,
 
@@ -268,7 +319,21 @@ if __name__ == '__main__':
 
         fg_boost_factor=args.fg_boost_factor,
         blend_power=args.blend_power,
+        cut_chunks=cut_chunks,
+        reset_at_cut=args.reset_at_cut,
+        oracle_token_masks=oracle_token_masks,
     )
+    if shot_frames:  # ✨ E0: decode every shot separately as well
+        _, out_latents = edit_video
+        if args.save_latents:
+            torch.save(out_latents.cpu(), args.save_latents)
+        vids, _s = [], 0
+        for _l in shot_latents:
+            pipeline.vae.model.clear_cache()
+            _v = pipeline.vae.decode_to_pixel(out_latents[:, _s:_s + _l], use_cache=False)
+            vids.append((_v * 0.5 + 0.5).clamp(0, 1))
+            _s += _l
+        edit_video = torch.cat(vids, dim=1)
 
     # Clear VAE cache
     pipeline.vae.model.clear_cache()

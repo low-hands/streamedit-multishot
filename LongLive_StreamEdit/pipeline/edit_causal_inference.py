@@ -94,6 +94,9 @@ class EditCausalInferencePipeline(torch.nn.Module):
 
         fg_scale=1.0,
         reuse_noise_temporal_mean=True,
+        cut_chunks: Optional[Iterable] = None,
+        reset_at_cut: str = "none",
+        oracle_token_masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not (independent_first_frame and triple_first_frame)
 
@@ -275,6 +278,10 @@ class EditCausalInferencePipeline(torch.nn.Module):
             all_num_frames = [1] + all_num_frames
         for current_num_frames in tqdm(all_num_frames):
             _dump_chunk_idx += 1
+            # ✨ E0: forget the previous shot when this chunk starts a new one
+            if cut_chunks is not None and _dump_chunk_idx in cut_chunks and reset_at_cut != "none":
+                self._reset_states_at_cut(kv_cache_src, kv_cache_trg, trg_fg_mask_cache,
+                                          current_start_frame, keep_sink=(reset_at_cut == "keep_sink"))
             if profile:
                 block_start.record()
 
@@ -307,6 +314,10 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 current_start=current_start_frame * self.frame_seq_length,
             )
             _, src_fg_mask_bin, _, _ = self._aggregate_crossattn_mask(crossattn_cache_src)
+            if oracle_token_masks is not None:  # ✨ E0: external grounding replaces cross-attn
+                _a = current_start_frame - num_input_frames
+                src_fg_mask_bin = oracle_token_masks[_a:_a + current_num_frames].reshape(1, -1).to(
+                    src_fg_mask_bin.device).expand_as(src_fg_mask_bin).clone()
             # inject to kv_cache
             self._inject_masks_to_kv_cache(
                 kv_cache_dual, trg_fg_mask_cache, src_fg_mask_bin,
@@ -392,7 +403,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
                     self._dump_masks(_dump_chunk_idx, src_map=src_fg_mask_map,
                                      vis_bin=mask_bin_vis, vis_soft=mask_soft_vis)
                     # inject union of origin src and in-processing trg masks to kv_cache
-                    inloop_trg_fg_mask = inloop_trg_fg_mask_bin | src_fg_mask_bin
+                    inloop_trg_fg_mask = src_fg_mask_bin if oracle_token_masks is not None \
+                        else (inloop_trg_fg_mask_bin | src_fg_mask_bin)
                     self._inject_masks_to_kv_cache(
                         kv_cache_dual, trg_fg_mask_cache, inloop_trg_fg_mask, 
                     )
@@ -414,7 +426,8 @@ class EditCausalInferencePipeline(torch.nn.Module):
             )
             #✨ store clean target kv cache, and obtain clean target mask
             _, trg_fg_mask_bin, _, _ = self._aggregate_crossattn_mask(crossattn_cache_trg)
-            current_trg_fg_mask = trg_fg_mask_bin | src_fg_mask_bin
+            current_trg_fg_mask = src_fg_mask_bin if oracle_token_masks is not None \
+                else (trg_fg_mask_bin | src_fg_mask_bin)
             self._update_trg_fg_mask_cache(trg_fg_mask_cache, current_trg_fg_mask, kv_cache_trg)
             self._kv_cache_to(kv_cache_trg, 'cpu', low_memory)
             
@@ -542,6 +555,26 @@ class EditCausalInferencePipeline(torch.nn.Module):
             save(vis_soft[0], "soft_src")
             if vis_soft.shape[0] > 1:
                 save(vis_soft[1], "soft_trg")
+
+    def _reset_states_at_cut(self, kv_cache_src, kv_cache_trg, trg_fg_mask_cache,
+                             current_start_frame, keep_sink):
+        '''
+        ✨ E0: forget the previous shot at a cut. The local KV window of both branches,
+        the target mask cache and the temporal-noise statistics are cleared. With
+        keep_sink the attention sink (first sink_size frames) survives; otherwise the
+        next chunk is written into the sink slots, exactly like the start of a video.
+        RoPE positions keep counting (current_start is not touched).
+        '''
+        tokens = current_start_frame * self.frame_seq_length
+        sink = int(getattr(self.args.model_kwargs, "sink_size", 0)) * self.frame_seq_length if keep_sink else 0
+        for cache in (kv_cache_src, kv_cache_trg):
+            for blk in cache:
+                blk["global_end_index"].fill_(tokens)
+                blk["local_end_index"].fill_(sink)
+        trg_fg_mask_cache["global_end_index"].fill_(tokens)
+        trg_fg_mask_cache["local_end_index"].fill_(sink)
+        if self.noise_temporal_mean is not None:
+            self.noise_temporal_mean = dict()
 
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override: int | None = None):
         """
