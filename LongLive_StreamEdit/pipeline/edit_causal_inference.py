@@ -97,6 +97,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
         cut_chunks: Optional[Iterable] = None,
         reset_at_cut: str = "none",
         oracle_token_masks: Optional[torch.Tensor] = None,
+        sog_mask: str = "velocity",
     ) -> torch.Tensor:
         assert not (independent_first_frame and triple_first_frame)
 
@@ -392,8 +393,25 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 #✨ source-oriented guidance
                 fg_mask = (v_trg - v_src).abs().mean(dim=2, keepdim=True)     # [B, F, 1, H, W]
                 data_dims = list(range(fg_mask.ndim))[1: ]
-                fg_mask = (fg_mask - fg_mask.amin(dim=data_dims, keepdim=True)) / \
-                    (fg_mask.amax(dim=data_dims, keepdim=True) - fg_mask.amin(dim=data_dims, keepdim=True) + 1e-7)
+                if sog_mask == "velocity" or oracle_token_masks is None:
+                    fg_mask = (fg_mask - fg_mask.amin(dim=data_dims, keepdim=True)) / \
+                        (fg_mask.amax(dim=data_dims, keepdim=True) - fg_mask.amin(dim=data_dims, keepdim=True) + 1e-7)
+                else:  # ✨ SOG grounded on the oracle mask
+                    _a = current_start_frame - num_input_frames
+                    _o = oracle_token_masks[_a:_a + current_num_frames].float().reshape(
+                        current_num_frames, 1, height // 2, width // 2)
+                    _o = F.interpolate(_o, size=(height, width), mode="nearest")
+                    _o = F.avg_pool2d(_o, 3, stride=1, padding=1, count_include_pad=False)
+                    _o = _o.unsqueeze(0).to(fg_mask)                       # [1, F, 1, H, W]
+                    if sog_mask == "replace":
+                        fg_mask = _o.expand_as(fg_mask)
+                    else:  # gate
+                        _in = _o > 0.5
+                        _lo = torch.where(_in, fg_mask, torch.full_like(fg_mask, float("inf"))).amin(dim=data_dims, keepdim=True)
+                        _hi = torch.where(_in, fg_mask, torch.full_like(fg_mask, float("-inf"))).amax(dim=data_dims, keepdim=True)
+                        _norm = ((fg_mask - _lo) / (_hi - _lo + 1e-7)).clamp(0, 1)
+                        _norm = torch.where(torch.isfinite(_norm), _norm, torch.zeros_like(_norm))
+                        fg_mask = _o * _norm
                 bg_mask = 1 - fg_mask
                 v_t = v_trg + bg_mask * (v_gt - v_src)
                 denoised_pred = noisy_pred_input - t_i * v_t

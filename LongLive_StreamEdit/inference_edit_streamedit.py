@@ -190,6 +190,8 @@ def build_parser():
     parser.add_argument("--oracle_dilate", type=int, default=1, help="token dilation radius for --oracle_mask")
     parser.add_argument("--oracle_invert", action="store_true", default=False,
                         help="use the complement of the (dilated) oracle mask, e.g. background edits")
+    parser.add_argument("--sog_mask", choices=["velocity", "gate", "replace"], default="velocity",
+                        help="SOG foreground: stock velocity gap, oracle-gated velocity gap, or the oracle mask")
     parser.add_argument("--save_latents", type=str, default=None, help="optional .pt path for output latents")
     parser.add_argument("--force_low_memory", choices=["on", "off"], default=None,
                         help="Override the free-VRAM < 40 GB heuristic. Unset = stock behaviour.")
@@ -327,6 +329,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         cut_chunks=cut_chunks,
         reset_at_cut=args.reset_at_cut,
         oracle_token_masks=oracle_token_masks,
+        sog_mask=args.sog_mask,
     )
     if shot_frames:  # ✨ E0: decode every shot separately as well
         _, out_latents = edit_video
