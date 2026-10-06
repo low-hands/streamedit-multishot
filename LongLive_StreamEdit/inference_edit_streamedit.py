@@ -429,6 +429,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
             x0_frames[(c, st)] = fr[[0, n_chunk // 2]]
         torch.save({"sog_fg": [torch.stack(s) for s in V["sog_fg"]],
                     "sog_corr": [torch.stack(s) for s in V["sog_corr"]],
+                    "sog_absdiff": [torch.stack(s) for s in V["sog_absdiff"]],
                     "attn_src": V["attn_src"], "attn_tinj": V["attn_tinj"],
                     "x0_frames": x0_frames, "seg_latents": [int(x) for x in _segs]}, args.viz_out)
         pipeline.vae.model.clear_cache()
