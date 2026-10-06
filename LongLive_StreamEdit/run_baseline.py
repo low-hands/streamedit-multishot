@@ -25,7 +25,7 @@ ONLY = sys.argv[2] if len(sys.argv) > 2 else None
 SEED = 0
 CONFIGS = [  # (clip, edit key, x0 chunks to decode)
     ("26422501_15_absence_6shot_12.5s", "pattern", "3,7,9,12,14"),
-    ("226154551_5_viewpoint_4shot_12.6s", "replacement", "4,9,12,14"),
+    ("226154551_5_viewpoint_4shot_12.6s", "replacement", "1,4,9,12,14"),
     ("468286765_89_absence_3shot_13.9s", "control", "5,9,10,14"),
 ]
 MODES = {
@@ -33,6 +33,8 @@ MODES = {
     "B_ours_velocity_v1": ["shot", "--sog_mask", "velocity", "--oracle_version", "v1"],
     "C_ours_gate": ["shot", "--sog_mask", "gate"],
     "C_ours_gate_v1": ["shot", "--sog_mask", "gate", "--oracle_version", "v1"],
+    "C_ours_gate_v1_r2": ["shot", "--sog_mask", "gate", "--oracle_version", "v1"],  # rerun with raw-diff viz
+    "D_ours_replace_v1": ["shot", "--sog_mask", "replace", "--oracle_version", "v1"],
 }
 
 edits = {c["clip"]: c for c in json.load(open(f"{POOL}/edits.json"))}

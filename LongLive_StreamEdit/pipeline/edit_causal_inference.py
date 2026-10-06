@@ -107,7 +107,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
         assert not (independent_first_frame and triple_first_frame)
         import time as _time
         self.timing = {"chunk_ms": [], "viz_ms": 0.0}
-        self.viz = {"sog_fg": [], "sog_corr": [], "attn_src": [], "attn_tinj": [], "x0": {}} if viz else None
+        self.viz = {"sog_fg": [], "sog_corr": [], "sog_absdiff": [], "attn_src": [], "attn_tinj": [], "x0": {}} if viz else None
         _viz_x0_chunks, _viz_x0_steps = set(viz_x0_chunks or []), set(viz_x0_steps or [])
 
         batch_size, num_frames, num_channels, height, width = src_video.shape
@@ -291,7 +291,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
             _dump_chunk_idx += 1
             torch.cuda.synchronize(); _blk_t0 = _time.perf_counter(); _blk_viz = 0.0
             if self.viz is not None:
-                self.viz["sog_fg"].append([]); self.viz["sog_corr"].append([])
+                self.viz["sog_fg"].append([]); self.viz["sog_corr"].append([]); self.viz["sog_absdiff"].append([])
             # ✨ E0: forget the previous shot when this chunk starts a new one
             if cut_chunks is not None and _dump_chunk_idx in cut_chunks and reset_at_cut != "none":
                 if reset_at_cut == "all":
@@ -407,6 +407,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 
                 #✨ source-oriented guidance
                 fg_mask = (v_trg - v_src).abs().mean(dim=2, keepdim=True)     # [B, F, 1, H, W]
+                _absdiff = fg_mask                                             # raw, for viz only
                 data_dims = list(range(fg_mask.ndim))[1: ]
                 if sog_mask == "velocity" or oracle_token_masks is None:
                     fg_mask = (fg_mask - fg_mask.amin(dim=data_dims, keepdim=True)) / \
@@ -441,6 +442,7 @@ class EditCausalInferencePipeline(torch.nn.Module):
                 if self.viz is not None:
                     torch.cuda.synchronize(); _v0 = _time.perf_counter()
                     self.viz["sog_fg"][-1].append(fg_mask.expand(-1, -1, 1, -1, -1)[0, :, 0].detach().half().cpu())
+                    self.viz["sog_absdiff"][-1].append(_absdiff[0, :, 0].detach().half().cpu())
                     self.viz["sog_corr"][-1].append(
                         (t_i * bg_mask * (v_gt - v_src)).abs().mean(dim=2)[0].detach().half().cpu())
                     if _dump_chunk_idx in _viz_x0_chunks and index in _viz_x0_steps:
