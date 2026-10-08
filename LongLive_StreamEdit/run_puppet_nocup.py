@@ -6,6 +6,7 @@ Usage (from LongLive_StreamEdit/): python run_puppet_nocup.py <edit_key>:<mode> 
   mode M = C + edit memory (1024 tokens/layer, first version)        reset none
   mode MR = C + edit memory, full reset at every cut (forget the scene, keep the edit)
   mode C0 = C without any mask dilation (attention token mask and SOG latent mask)
+  mode CN = C with --oracle_dilate_mode nogap
 Outputs e0_runs/baseline/s15/<clip>/<edit_key>/<A_stock|C_ours_gate_v1>_nocup.mp4 (+ timing, viz).
 """
 import json
@@ -34,7 +35,7 @@ for job in sys.argv[1:]:
     assert DROP in sp and DROP in tp
     sp, tp = sp.replace(DROP, ""), tp.replace(DROP, "")
     tag = {"A": "A_stock_nocup", "C": "C_ours_gate_v1_nocup", "M": "M_mem_nocup", "MR": "M_mem_resetall_nocup",
-           "C0": "C_ours_gate_v1_nodil_nocup"}[mode]
+           "C0": "C_ours_gate_v1_nodil_nocup", "CN": "C_ours_gate_v1_nogap_nocup"}[mode]
     d = f"/root/autodl-tmp/e0_runs/baseline/s15/{CLIP}/{ek}"
     os.makedirs(d, exist_ok=True)
     mp4 = f"{d}/{tag}.mp4"
@@ -52,6 +53,8 @@ for job in sys.argv[1:]:
                  "--oracle_mask", npz, "--oracle_version", "v1", "--sog_mask", "gate"]
         # C0: no dilation at all (attention token mask and SOG latent mask straight from SAM3)
         argv += ["--oracle_dilate", "0", "--oracle_lat_dilate", "0"] if mode == "C0" else ["--oracle_dilate", "1"]
+        if mode == "CN":  # CN: dilate outward without bridging gaps (--oracle_dilate_mode nogap)
+            argv += ["--oracle_dilate_mode", "nogap"]
         if mode in ("M", "MR"):
             argv += ["--edit_mem", "1024", "--mem_delta", "3"]
     set_seed(0)
