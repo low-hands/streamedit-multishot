@@ -9,7 +9,8 @@ Header: mode, frame, shot, KEY on SAM3 keyframes of that P run, pixel IoU of its
 
 Writes <OUT>/<clip>/<edit>/cmp_masks.mp4 (the cmp_ prefix keeps eval_e0.py away from it); skips edits
 whose three videos are not all there yet. CPU only.
-Run from LongLive_StreamEdit/:  python viz_maskprop_edit.py [--tokens] [only_clip_or_edit_substring]
+Run from LongLive_StreamEdit/:  python viz_maskprop_edit.py [--v1] [--tokens] [only_clip_or_edit_substring]
+(default reads the --v0 runs in maskprop_edit_v0, --v1 the v1 runs in maskprop_edit)
 """
 import json
 import os
@@ -23,7 +24,7 @@ from mask_prop_eval import H, W, load_masks, pool_ge
 
 POOL = "/root/autodl-tmp/pool_v3"
 PRED = "/root/autodl-tmp/e0_runs/maskprop_v2"
-OUT = "/root/autodl-tmp/e0_runs/maskprop_edit/s15"
+OUT = "/root/autodl-tmp/e0_runs/maskprop_edit/s15" if "--v1" in sys.argv else "/root/autodl-tmp/e0_runs/maskprop_edit_v0/s15"
 MASKS = {"C": f"{POOL}/sam3_masks_v2", "P_mv12": f"{PRED}/pred_mv_12", "P_mva24": f"{PRED}/pred_mv_a24r1.25"}
 TOKENS = "--tokens" in sys.argv
 ONLY = next((a for a in sys.argv[1:] if not a.startswith("--")), None)

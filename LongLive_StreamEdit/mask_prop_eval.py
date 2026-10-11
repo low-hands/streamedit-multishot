@@ -17,9 +17,10 @@ Schedules (keyframes are always placed at shot starts; cuts come from the manife
          (r = --area_ratio, or per schedule: a24r1.25)
   In every schedule an empty mask (object not found / left) is re-checked every --search frames.
 
-Comparison is done after the exact v1 conversion used by inference_edit_streamedit.py (causal glitch
-filter -> majority over the 4 frames of a latent -> 8 px latent cell >= 50% -> 16 px token >= 50%),
-so the numbers are what the editor would actually see:
+Comparison is done after the exact conversion used by inference_edit_streamedit.py, so the numbers are
+what the editor would actually see. --conv v1 (default): causal glitch filter -> majority over the 4 frames
+of a latent -> 8 px latent cell >= 50% -> 16 px token >= 50%. --conv v0: union over the 4 frames -> 16 px
+token covered > 10%; the SOG side then uses the token mask, so lat_* is the token mask at latent size.
   tok_iou      token masks (attention side, before dilation)    tok_iou_d1   both dilated by 1 token
   lat_iou      latent masks (SOG side, before dilation)         px_iou       frame masks, before conversion
   IoU is averaged over latents where either mask is non-empty; drift = tok_iou vs frames since keyframe.
@@ -100,6 +101,20 @@ def to_latent_token(mb, shot_frames):
         s += n
     lat = np.concatenate(lats)
     return lat, pool_ge(lat.astype(np.float32), 2), np.array(first)
+
+
+def to_latent_token_v0(mb, shot_frames):
+    """--oracle_version v0: union over the frames of a latent, token = 16 px cell covered > 10%."""
+    toks, first, s = [], [], 0
+    for n in shot_frames:
+        groups = [[0]] + [list(range(4 * k - 3, 4 * k + 1)) for k in range(1, (n - 1) // 4 + 1)]
+        px = np.stack([mb[s:s + n][g].any(0) for g in groups]).astype(np.float32)
+        L, h, w = px.shape
+        toks.append(px.reshape(L, h // 16, 16, w // 16, 16).mean((2, 4)) > 0.1)
+        first += [s + g[0] for g in groups]
+        s += n
+    tok = np.concatenate(toks)
+    return tok.repeat(2, 1).repeat(2, 2), tok, np.array(first)
 
 
 def dilate(x, r=1):
@@ -254,7 +269,8 @@ def evaluate(name, video, masks, shot_frames, args, ffmpeg):
     methods = args.methods.split(",")
     mv_maps, mv_ms = load_mv_maps(video, T, ffmpeg) if "mv" in methods else (None, 0.0)
     flow = DIS(args.flow_scale, {"ultrafast": 0, "fast": 1, "medium": 2}[args.dis_preset])
-    lat_ref, tok_ref, first = to_latent_token(ref, shot_frames)
+    convert = to_latent_token_v0 if args.conv == "v0" else to_latent_token
+    lat_ref, tok_ref, first = convert(ref, shot_frames)
     tok_ref_d = dilate(tok_ref)
     res = {"name": name, "video": video, "masks": masks, "shot_frames": shot_frames, "frames": T,
            "ref_area": float(ref.mean()), "ref_empty_frames": int((ref.sum((1, 2)) == 0).sum()),
@@ -274,7 +290,7 @@ def evaluate(name, video, masks, shot_frames, args, ffmpeg):
                 d = os.path.join(args.out, f"pred_{method}_{schedule}")
                 os.makedirs(d, exist_ok=True)
                 np.savez_compressed(os.path.join(d, name + ".npz"), masks=pred, keyframes=np.nonzero(key)[0])
-            lat, tok, _ = to_latent_token(pred, shot_frames)
+            lat, tok, _ = convert(pred, shot_frames)
             ti = iou_per(tok, tok_ref)
             # frames between the latent's first frame and the keyframe it was carried from
             kidx = np.maximum.accumulate(np.where(key, np.arange(T), 0))
@@ -421,6 +437,7 @@ def main():
     p.add_argument("--area_ratio", type=float, default=1.5, help="adaptive schedule: re-key outside [1/r, r]")
     p.add_argument("--flow_scale", type=float, default=0.5)
     p.add_argument("--dis_preset", choices=["ultrafast", "fast", "medium"], default="fast")
+    p.add_argument("--conv", choices=["v0", "v1"], default="v1", help="mask conversion used for the comparison")
     p.add_argument("--viz", default="", help="method:schedule panels for the overlay video, e.g. mv:12,dis:12,hold:12")
     p.add_argument("--viz_tokens", action="store_true", help="draw masks at 16 px token level")
     p.add_argument("--save_pred", default="", help="method:schedule list whose masks are saved, e.g. mv:a48,mv:12")

@@ -1,14 +1,15 @@
 """Does keyframe-SAM3 + cheap propagation edit as well as per-frame SAM3?
 
-Same setting C as run_mem_check.py (per-shot VAE, v1 mask, dilate 1, SOG gate, reset none, no memory);
+Same setting C as run_mem_check.py (per-shot VAE, dilate 1, SOG gate, reset none, no memory), with the
+pixel->token mask conversion chosen by --v0 (default) or --v1 (see --oracle_version);
 only the mask npz given to --oracle_mask changes:
   C        per-frame SAM3 (sam3_masks_v2)
   P_mv12   SAM3 every 12 frames + codec motion-vector propagation   (mask_prop_eval.py --save_pred mv:12)
   P_mva24  SAM3 adaptive (area x1.25, <= 24 frames) + motion vectors (--save_pred mv:a24r1.25)
 Every edit in edits.json whose mask exists in all prediction dirs is run.
-Outputs e0_runs/maskprop_edit/s15/<clip>/<edit>/<mode>.mp4 (+ _timing.json); resumable. Then:
-  python eval_e0.py /root/autodl-tmp/e0_runs/maskprop_edit/s15
-Run from LongLive_StreamEdit/:  python run_maskprop_edit.py [only_clip_or_edit_substring]
+Outputs e0_runs/maskprop_edit_v0/s15 (v1: e0_runs/maskprop_edit/s15)/<clip>/<edit>/<mode>.mp4
+(+ _timing.json); resumable. Then:  python eval_e0.py /root/autodl-tmp/e0_runs/maskprop_edit_v0/s15
+Run from LongLive_StreamEdit/:  python run_maskprop_edit.py [--v1] [only_clip_or_edit_substring]
 """
 import json
 import os
@@ -23,8 +24,9 @@ from utils.misc import set_seed
 
 POOL = "/root/autodl-tmp/pool_v3"
 PRED = "/root/autodl-tmp/e0_runs/maskprop_v2"
-OUT = "/root/autodl-tmp/e0_runs/maskprop_edit/s15"
-ONLY = sys.argv[1] if len(sys.argv) > 1 else None
+VERSION = "v1" if "--v1" in sys.argv else "v0"
+OUT = "/root/autodl-tmp/e0_runs/maskprop_edit/s15" if VERSION == "v1" else "/root/autodl-tmp/e0_runs/maskprop_edit_v0/s15"
+ONLY = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
 MODES = {"C": f"{POOL}/sam3_masks_v2", "P_mv12": f"{PRED}/pred_mv_12", "P_mva24": f"{PRED}/pred_mv_a24r1.25"}
 
 edits = json.load(open(f"{POOL}/edits.json"))
@@ -38,7 +40,7 @@ for c in edits:
             continue
         if all(os.path.exists(f"{d}/{name}") for d in MODES.values()):
             jobs += [(c, ek, e, mode, f"{d}/{name}") for mode, d in MODES.items()]
-print(f"{len(jobs)} runs", flush=True)
+print(f"{len(jobs)} runs, mask {VERSION}, -> {OUT}", flush=True)
 
 parser = ies.build_parser()
 common = ["--fg_boost_factor", "2", "--blend_power", "2", "--step", "15", "--seed", "0", "--force_low_memory", "off"]
@@ -57,7 +59,7 @@ for i, (c, ek, e, mode, npz) in enumerate(jobs):
     argv = ["--data_path", m["video"], "--save_path", mp4, "--src_prompt", c["src_prompt"], "--trg_prompt", e["trg_prompt"],
             "--src_word", e["src_word"], "--trg_word", e["trg_word"],
             "--shot_frames", ",".join(str(n) for n in m["shot_frames"]), "--reset_at_cut", "none",
-            "--oracle_mask", npz, "--oracle_version", "v1", "--oracle_dilate", "1", "--sog_mask", "gate",
+            "--oracle_mask", npz, "--oracle_version", VERSION, "--oracle_dilate", "1", "--sog_mask", "gate",
             "--timing_out", f"{d}/{mode}_timing.json"] + common
     if e.get("sam3_invert"):
         argv.append("--oracle_invert")
@@ -70,7 +72,7 @@ for i, (c, ek, e, mode, npz) in enumerate(jobs):
         print(err, flush=True)
     pipeline.vae.model.clear_cache()
     torch.cuda.empty_cache()
-    rec = {"clip": c["clip"], "edit": ek, "mode": mode, "mask": npz, "exit": rc, "seconds": round(time.time() - t0), "video": mp4}
+    rec = {"clip": c["clip"], "edit": ek, "mode": mode, "version": VERSION, "mask": npz, "exit": rc, "seconds": round(time.time() - t0), "video": mp4}
     if err:
         rec["error"] = err[-500:]
     log.write(json.dumps(rec) + "\n"); log.flush()
