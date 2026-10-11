@@ -151,6 +151,25 @@ def load_gray(video, T):
     return np.stack(out)
 
 
+def mv_cells(a):
+    """motion vectors of one frame (PyAV MOTION_VECTORS array) -> backward displacement on the 4 px cell grid
+    [H/4, W/4, 2]; only past references (P-only, refs=1: the previous frame); zero where there is no vector."""
+    cells = np.zeros((H // 4, W // 4, 2), np.float32)
+    a = a[a["source"] < 0]
+    sc = a["motion_scale"].astype(np.float32)
+    d = np.stack([a["motion_x"] / sc, a["motion_y"] / sc], -1)  # src = dst + motion / scale
+    # paint every block (H.264 partitions are multiples of 4 px), one block size at a time
+    bw, bh = a["w"].astype(int), a["h"].astype(int)
+    cx, cy = (a["dst_x"].astype(int) - bw // 2) // 4, (a["dst_y"].astype(int) - bh // 2) // 4
+    for w, h in set(zip(bw.tolist(), bh.tolist())):
+        i = np.nonzero((bw == w) & (bh == h))[0]
+        oy, ox = np.meshgrid(np.arange(h // 4), np.arange(w // 4), indexing="ij")
+        yy, xx = cy[i, None, None] + oy, cx[i, None, None] + ox
+        ok = (yy >= 0) & (yy < H // 4) & (xx >= 0) & (xx < W // 4)
+        cells[yy[ok], xx[ok]] = np.broadcast_to(d[i, None, None], yy.shape + (2,))[ok]
+    return cells
+
+
 def load_mv_maps(video, T, ffmpeg):
     """Backward maps from codec motion vectors: frame t pixel p comes from frame t-1 at p + d_t(p).
     Returns float32 [T, H/4, W/4, 2] (dx, dy) on the 4 px cell grid, zero where no vector (I-frames, intra blocks), and the ms/frame of
@@ -169,21 +188,8 @@ def load_mv_maps(video, T, ffmpeg):
                 if t == T:
                     break
                 sd = fr.side_data.get("MOTION_VECTORS")
-                if sd is None:
-                    continue
-                a = sd.to_ndarray()
-                a = a[a["source"] < 0]  # past reference = previous frame (P-only, refs=1)
-                sc = a["motion_scale"].astype(np.float32)
-                d = np.stack([a["motion_x"] / sc, a["motion_y"] / sc], -1)  # src = dst + motion / scale
-                # paint every block on a 4 px cell grid (H.264 partitions are multiples of 4), one size at a time
-                bw, bh = a["w"].astype(int), a["h"].astype(int)
-                cx, cy = (a["dst_x"].astype(int) - bw // 2) // 4, (a["dst_y"].astype(int) - bh // 2) // 4
-                for w, h in set(zip(bw.tolist(), bh.tolist())):
-                    i = np.nonzero((bw == w) & (bh == h))[0]
-                    oy, ox = np.meshgrid(np.arange(h // 4), np.arange(w // 4), indexing="ij")
-                    yy, xx = cy[i, None, None] + oy, cx[i, None, None] + ox
-                    ok = (yy >= 0) & (yy < H // 4) & (xx >= 0) & (xx < W // 4)
-                    maps[t, yy[ok], xx[ok]] = np.broadcast_to(d[i, None, None], yy.shape + (2,))[ok]
+                if sd is not None:
+                    maps[t] = mv_cells(sd.to_ndarray())
         assert t >= T - 1, f"re-encode lost frames: {t + 1} < {T}"
     return maps, (time.perf_counter() - t0) * 1e3 / T
 
