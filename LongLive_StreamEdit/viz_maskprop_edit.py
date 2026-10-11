@@ -1,8 +1,8 @@
 """Side-by-side view of run_maskprop_edit.py outputs with the masks each run actually used.
 
 2 x 2 panels per frame:
-  source + per-frame SAM3 mask (green)    | C        edit + its mask (per-frame SAM3, green)
-  P_mv12 edit + its mask (red)            | P_mva24  edit + its mask (red)
+  source + per-frame SAM3 mask (green)    | C  edit + its mask (per-frame SAM3, green)
+  source + P mask (red)                   | P  edit + its mask (red)
 On the P panels the per-frame SAM3 mask is drawn too (thin green), so drift shows as red vs green.
 Header: mode, frame, shot, KEY on SAM3 keyframes of that P run, pixel IoU of its mask vs per-frame SAM3.
 --tokens draws masks at 16 px token level (what attention uses) instead of pixel level.
@@ -23,9 +23,9 @@ import numpy as np
 from mask_prop_eval import H, W, load_masks, pool_ge
 
 POOL = "/root/autodl-tmp/pool_v3"
-PRED = "/root/autodl-tmp/e0_runs/maskprop_v2"
+PRED = "/root/autodl-tmp/e0_runs/maskprop_final"
 OUT = "/root/autodl-tmp/e0_runs/maskprop_edit/s15" if "--v1" in sys.argv else "/root/autodl-tmp/e0_runs/maskprop_edit_v0/s15"
-MASKS = {"C": f"{POOL}/sam3_masks_v2", "P_mv12": f"{PRED}/pred_mv_12", "P_mva24": f"{PRED}/pred_mv_a24r1.25"}
+MASKS = {"C": f"{POOL}/sam3_masks_v2", "P": f"{PRED}/pred_mv_a16r1.15"}
 TOKENS = "--tokens" in sys.argv
 ONLY = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
 GREEN, RED, YELLOW = (40, 255, 40), (255, 50, 50), (255, 220, 0)
@@ -91,11 +91,11 @@ def render(clip, ek, e, m):
         ref = as_drawn(masks["C"][t])
         tiles = [panel(src[t], ref, GREEN, None, f"source  f{t} shot{shot}", False),
                  panel(out["C"][t], ref, GREEN, None, f"C (SAM3 every frame)  f{t}", False)]
-        for k in ("P_mv12", "P_mva24"):
-            p = as_drawn(masks[k][t])
-            u = (p | ref).sum()
-            iou = f"{(p & ref).sum() / u:.2f}" if u else "-"
-            tiles.append(panel(out[k][t], p, RED, ref, f"{k}  f{t}  IoU {iou}", t in keys[k]))
+        p = as_drawn(masks["P"][t])
+        u = (p | ref).sum()
+        iou = f"{(p & ref).sum() / u:.2f}" if u else "-"
+        tiles.append(panel(src[t], p, RED, ref, f"source + P mask  f{t}  IoU {iou}", t in keys["P"]))
+        tiles.append(panel(out["P"][t], p, RED, ref, f"P (keyframe SAM3 + mv)  f{t}", t in keys["P"]))
         canvas = np.concatenate([np.concatenate(tiles[:2], 1), np.concatenate(tiles[2:], 1)], 0)
         for pkt in st.encode(av.VideoFrame.from_ndarray(canvas, format="rgb24")):
             c.mux(pkt)

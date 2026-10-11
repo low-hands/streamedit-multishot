@@ -3,9 +3,10 @@
 Same setting C as run_mem_check.py (per-shot VAE, dilate 1, SOG gate, reset none, no memory), with the
 pixel->token mask conversion chosen by --v0 (default) or --v1 (see --oracle_version);
 only the mask npz given to --oracle_mask changes:
-  C        per-frame SAM3 (sam3_masks_v2)
-  P_mv12   SAM3 every 12 frames + codec motion-vector propagation   (mask_prop_eval.py --save_pred mv:12)
-  P_mva24  SAM3 adaptive (area x1.25, <= 24 frames) + motion vectors (--save_pred mv:a24r1.25)
+  C   per-frame SAM3 (sam3_masks_v2), the reference
+  P   the chosen setting (docs/mask_propagation_2026-10-11.md): SAM3 on keyframes (shot start, area change
+      > x1.15, at most 16 frames apart) + codec motion-vector propagation; made by
+      python mask_prop_eval.py --out /root/autodl-tmp/e0_runs/maskprop_final --methods mv --schedules a16r1.15 --save_pred mv:a16r1.15
 Every edit in edits.json whose mask exists in all prediction dirs is run.
 Outputs e0_runs/maskprop_edit_v0/s15 (v1: e0_runs/maskprop_edit/s15)/<clip>/<edit>/<mode>.mp4
 (+ _timing.json); resumable. Then:  python eval_e0.py /root/autodl-tmp/e0_runs/maskprop_edit_v0/s15
@@ -23,11 +24,11 @@ import inference_edit_streamedit as ies
 from utils.misc import set_seed
 
 POOL = "/root/autodl-tmp/pool_v3"
-PRED = "/root/autodl-tmp/e0_runs/maskprop_v2"
+PRED = "/root/autodl-tmp/e0_runs/maskprop_final"
 VERSION = "v1" if "--v1" in sys.argv else "v0"
 OUT = "/root/autodl-tmp/e0_runs/maskprop_edit/s15" if VERSION == "v1" else "/root/autodl-tmp/e0_runs/maskprop_edit_v0/s15"
 ONLY = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
-MODES = {"C": f"{POOL}/sam3_masks_v2", "P_mv12": f"{PRED}/pred_mv_12", "P_mva24": f"{PRED}/pred_mv_a24r1.25"}
+MODES = {"C": f"{POOL}/sam3_masks_v2", "P": f"{PRED}/pred_mv_a16r1.15"}
 
 edits = json.load(open(f"{POOL}/edits.json"))
 meta = {m["name"]: m for m in json.load(open(f"{POOL}/manifest_aligned_v2.json"))}
