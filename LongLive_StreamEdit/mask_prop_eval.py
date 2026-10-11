@@ -14,6 +14,7 @@ Schedules (keyframes are always placed at shot starts; cuts come from the manife
   N      a keyframe every N frames (e.g. 12, 24, 48)
   shot   only at shot starts
   aN     adaptive: a keyframe when the propagated area leaves [1/r, r] x the keyframe area, at most N apart
+         (r = --area_ratio, or per schedule: a24r1.25)
   In every schedule an empty mask (object not found / left) is re-checked every --search frames.
 
 Comparison is done after the exact v1 conversion used by inference_edit_streamedit.py (causal glitch
@@ -25,6 +26,17 @@ so the numbers are what the editor would actually see:
   sam_per_100f = keyframes per 100 frames, prop_ms = propagation compute per frame (mv: plus decoding with
   vector export and building the maps; plain decoding excluded). A latent where the object appears while the
   mask is still empty (waiting for the next --search keyframe) counts as IoU 0.
+
+Per mask it also prints the object size in tokens and ref_consec = token IoU of the reference between
+consecutive latents of a shot (how much the object itself moves / the reference jitters at token level).
+
+--save_pred mv:a48,mv:12 writes the propagated masks as <out>/pred_<method>_<schedule>/<name>.npz in the
+sam3_masks_v2 format (`masks` bool [T, 480, 832], plus `keyframes`), usable as --oracle_mask for editing.
+
+--viz mv:12,dis:12,hold:12 writes <out>/viz/<name>.mp4: one panel per method:schedule, the source frame
+with the per-frame SAM3 mask (green outline) and the propagated mask (red fill); the header shows the
+frame, the shot, KEY on SAM3 keyframes and the frame's pixel IoU. --viz_tokens draws both at 16 px token level
+(what attention sees) instead of pixel level.
 
 Usage (server):  python mask_prop_eval.py --out /root/autodl-tmp/e0_runs/maskprop
 Single input:    python mask_prop_eval.py --video v.mp4 --masks m.npz --shot_frames 117,45 --out dir
@@ -180,17 +192,19 @@ class DIS:
         return cv2.resize(f, (W, H), interpolation=cv2.INTER_LINEAR) / self.s
 
 
-def parse_schedule(s):
+def parse_schedule(s, area_ratio):
+    """-> (max gap, adaptive area ratio or None)"""
     if s == "shot":
         return 10 ** 9, None
     if s.startswith("a"):
-        return int(s[1:]), True
+        n, _, r = s[1:].partition("r")
+        return int(n), float(r) if r else area_ratio
     return int(s), None
 
 
 def run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args):
     """Propagate; returns (pred bool [T, H, W], keyframe flags [T], ms/frame of propagation)."""
-    max_gap, adaptive = parse_schedule(schedule)
+    max_gap, ratio = parse_schedule(schedule, args.area_ratio)
     T = len(ref)
     pred = np.zeros_like(ref)
     key = np.zeros(T, bool)
@@ -205,8 +219,8 @@ def run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args):
         elif empty:
             do_key = gap >= args.search
         else:
-            do_key = gap >= max_gap or (adaptive and key_area > 0 and
-                                        not (1 / args.area_ratio <= area / key_area <= args.area_ratio))
+            do_key = gap >= max_gap or (ratio is not None and key_area > 0 and
+                                        not (1 / ratio <= area / key_area <= ratio))
         if do_key:
             soft, last_key, key[t] = ref[t].astype(np.float32), t, True
             key_area = ref[t].sum()
@@ -222,6 +236,15 @@ def run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args):
     return pred, key, ms / n_prop
 
 
+def ref_consec(tok, shot_frames):
+    """token IoU of the reference between consecutive latents inside a shot."""
+    lens = [1 + (n - 1) // 4 for n in shot_frames]
+    starts = np.concatenate([[0], np.cumsum(lens)[:-1]]).astype(int)
+    vals = [iou_per(tok[a + 1:a + l], tok[a:a + l - 1]) for a, l in zip(starts, lens) if l > 1]
+    v = np.concatenate(vals) if vals else np.array([np.nan])
+    return float(np.nanmean(v)) if np.isfinite(v).any() else None
+
+
 def evaluate(name, video, masks, shot_frames, args, ffmpeg):
     T = sum(shot_frames)
     ref = load_masks(masks, T)
@@ -234,12 +257,23 @@ def evaluate(name, video, masks, shot_frames, args, ffmpeg):
     lat_ref, tok_ref, first = to_latent_token(ref, shot_frames)
     tok_ref_d = dilate(tok_ref)
     res = {"name": name, "video": video, "masks": masks, "shot_frames": shot_frames, "frames": T,
-           "ref_area": float(ref.mean()), "ref_empty_frames": int((ref.sum((1, 2)) == 0).sum()), "runs": []}
+           "ref_area": float(ref.mean()), "ref_empty_frames": int((ref.sum((1, 2)) == 0).sum()),
+           "ref_tokens": float(np.mean([n for n in tok_ref.sum((1, 2)) if n > 0] or [0])),
+           "ref_consec": ref_consec(tok_ref, shot_frames), "runs": []}
+    save = {tuple(x.split(":")) for x in args.save_pred.split(",") if x}
+    viz = [tuple(x.split(":")) for x in args.viz.split(",") if x]
+    viz_runs = {}
     for method in methods:
         for schedule in args.schedules.split(","):
             pred, key, ms = run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args)
             if method == "mv":
                 ms += mv_ms
+            if (method, schedule) in viz:
+                viz_runs[(method, schedule)] = (pred, key)
+            if (method, schedule) in save:
+                d = os.path.join(args.out, f"pred_{method}_{schedule}")
+                os.makedirs(d, exist_ok=True)
+                np.savez_compressed(os.path.join(d, name + ".npz"), masks=pred, keyframes=np.nonzero(key)[0])
             lat, tok, _ = to_latent_token(pred, shot_frames)
             ti = iou_per(tok, tok_ref)
             # frames between the latent's first frame and the keyframe it was carried from
@@ -260,10 +294,62 @@ def evaluate(name, video, masks, shot_frames, args, ffmpeg):
                  "sam_calls": int(key.sum()), "sam_per_100f": float(key.sum() / T * 100),
                  "prop_ms": ms, "drift_tok_iou": drift}
             res["runs"].append(r)
-            print(f"  {name[:40]:40s} {method:5s} {schedule:5s} tok {r['tok_iou']:.3f} tok_d1 {r['tok_iou_d1']:.3f} "
+            print(f"  {name[:40]:40s} {method:5s} {schedule:9s} tok {r['tok_iou']:.3f} tok_d1 {r['tok_iou_d1']:.3f} "
                   f"lat {r['lat_iou']:.3f} px {r['px_iou']:.3f}  sam/100f {r['sam_per_100f']:5.1f}  "
                   f"{ms:6.2f} ms/f", flush=True)
+    if viz:
+        render(os.path.join(args.out, "viz", name + ".mp4"), video, ref, shot_frames,
+               [(m, s) + viz_runs[(m, s)] for m, s in viz if (m, s) in viz_runs], args.viz_tokens)
     return res
+
+
+def render(path, video, ref, shot_frames, runs, tokens):
+    """Overlay video: one panel per (method, schedule, pred, keyframes), half resolution, 2 columns."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    T = len(ref)
+    starts = np.concatenate([[0], np.cumsum(shot_frames)[:-1]]).astype(int)
+    shot_of = np.searchsorted(starts, np.arange(T), side="right") - 1
+    if tokens:  # 16 px token level, before dilation, per frame (no latent grouping)
+        tok = lambda m: np.kron(pool_ge(m[None].astype(np.float32), 16)[0], np.ones((16, 16), bool))
+    else:
+        tok = lambda m: m
+    h, w = H // 2, W // 2
+    cols = 2
+    n = len(runs)
+    rows_ = (n + cols - 1) // cols
+    out = av.open(path, "w")
+    st = out.add_stream("libx264", rate=16)
+    st.width, st.height, st.pix_fmt = cols * w, rows_ * h, "yuv420p"
+    st.options = {"crf": "20"}
+    with av.open(video) as c:
+        for t, fr in enumerate(c.decode(video=0)):
+            if t == T:
+                break
+            rgb = cv2.resize(fr.to_ndarray(format="rgb24"), (W, H), interpolation=cv2.INTER_AREA)
+            r = tok(ref[t])
+            canvas = np.zeros((rows_ * h, cols * w, 3), np.uint8)
+            for i, (m, s, pred, key) in enumerate(runs):
+                p = tok(pred[t])
+                img = rgb.copy()
+                img[p] = (0.55 * img[p] + 0.45 * np.array([255, 40, 40])).astype(np.uint8)
+                cnt, _ = cv2.findContours(r.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                cv2.drawContours(img, cnt, -1, (40, 255, 40), 3)
+                img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+                u = (p | r).sum()
+                iou = f"{(p & r).sum() / u:.2f}" if u else "-"
+                kf = key[:t + 1].nonzero()[0]
+                txt = f"{m} {s}  f{t} shot{shot_of[t]}  +{t - kf[-1] if len(kf) else 0}  IoU {iou}"
+                cv2.rectangle(img, (0, 0), (w, 22), (0, 0, 0), -1)
+                cv2.putText(img, txt, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                if key[t]:
+                    cv2.putText(img, "KEY (SAM3)", (w - 105, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 220, 0), 1, cv2.LINE_AA)
+                y, x = (i // cols) * h, (i % cols) * w
+                canvas[y:y + h, x:x + w] = img
+            for pkt in st.encode(av.VideoFrame.from_ndarray(canvas, format="rgb24")):
+                out.mux(pkt)
+    for pkt in st.encode():
+        out.mux(pkt)
+    out.close()
 
 
 def summarize(results, out):
@@ -272,7 +358,7 @@ def summarize(results, out):
         for r in res["runs"]:
             rows.setdefault((r["method"], r["schedule"]), []).append(r)
     summ = []
-    print(f"\n{'method':6s} {'sched':6s} {'n':>3s} {'tok_iou':>8s} {'worst':>6s} {'tok_d1':>7s} {'lat_iou':>8s} "
+    print(f"\n{'method':6s} {'sched':9s} {'n':>3s} {'tok_iou':>8s} {'worst':>6s} {'tok_d1':>7s} {'lat_iou':>8s} "
           f"{'px_iou':>7s} {'sam/100f':>9s} {'ms/f':>6s}   drift tok_iou by frames since keyframe")
     for (m, s), rs in rows.items():
         g = lambda k: float(np.mean([r[k] for r in rs]))
@@ -284,9 +370,17 @@ def summarize(results, out):
                "prop_ms": g("prop_ms"), "drift_tok_iou": drift}
         summ.append(row)
         ds = " ".join(f"{b}:{'  -  ' if v is None else f'{v:.3f}'}" for b, v in drift.items())
-        print(f"{m:6s} {s:6s} {len(rs):3d} {row['tok_iou']:8.3f} {row['tok_iou_worst']:6.3f} {row['tok_iou_d1']:7.3f} "
+        print(f"{m:6s} {s:9s} {len(rs):3d} {row['tok_iou']:8.3f} {row['tok_iou_worst']:6.3f} {row['tok_iou_d1']:7.3f} "
               f"{row['lat_iou']:8.3f} {row['px_iou']:7.3f} {row['sam_per_100f']:9.1f} {row['prop_ms']:6.2f}   {ds}")
     json.dump(summ, open(os.path.join(out, "summary.json"), "w"), indent=1)
+
+    cols = [k for k in (("hold", "12"), ("mv", "12"), ("dis", "12"), ("mv", "a48"), ("mv", "shot")) if k in rows]
+    print(f"\n{'mask':48s} {'area%':>6s} {'tokens':>7s} {'ref_consec':>10s} " + " ".join(f"{m + ' ' + s:>9s}" for m, s in cols))
+    for res in results:
+        by = {(r["method"], r["schedule"]): r["tok_iou"] for r in res["runs"]}
+        rc = res.get("ref_consec")
+        print(f"{res['name'][:48]:48s} {100 * res['ref_area']:6.2f} {res.get('ref_tokens', float('nan')):7.1f} "
+              f"{'   -' if rc is None else f'{rc:10.3f}'} " + " ".join(f"{by.get(k, float('nan')):9.3f}" for k in cols))
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -327,6 +421,9 @@ def main():
     p.add_argument("--area_ratio", type=float, default=1.5, help="adaptive schedule: re-key outside [1/r, r]")
     p.add_argument("--flow_scale", type=float, default=0.5)
     p.add_argument("--dis_preset", choices=["ultrafast", "fast", "medium"], default="fast")
+    p.add_argument("--viz", default="", help="method:schedule panels for the overlay video, e.g. mv:12,dis:12,hold:12")
+    p.add_argument("--viz_tokens", action="store_true", help="draw masks at 16 px token level")
+    p.add_argument("--save_pred", default="", help="method:schedule list whose masks are saved, e.g. mv:a48,mv:12")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     import imageio_ffmpeg
@@ -345,7 +442,10 @@ def main():
                 continue
             for e in c["edits"].values():  # one job per (clip, SAM3 prompt): several edits can share a mask
                 npz = f"{args.pool}/sam3_masks_v2/{c['clip']}__{e['sam3_prompt'].replace(' ', '_')}.npz"
-                if npz in seen or not os.path.exists(npz):
+                if npz in seen:
+                    continue
+                if not os.path.exists(npz):
+                    print(f"skip (no SAM3 mask): {npz}", flush=True)
                     continue
                 seen.add(npz)
                 m = meta[c["clip"]]
@@ -354,7 +454,10 @@ def main():
     results = []
     for name, video, masks, sf in jobs:
         js = os.path.join(args.out, name + ".json")
-        if os.path.exists(js):  # resumable
+        want = [os.path.join(args.out, f"pred_{x.replace(':', '_')}", name + ".npz") for x in args.save_pred.split(",") if x]
+        if args.viz:
+            want.append(os.path.join(args.out, "viz", name + ".mp4"))
+        if os.path.exists(js) and all(os.path.exists(f) for f in want):  # resumable
             results.append(json.load(open(js)))
             continue
         res = evaluate(name, video, masks, sf, args, ffmpeg)
