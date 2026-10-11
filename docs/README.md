@@ -5,6 +5,7 @@
 | [analysis_survey.md](analysis_survey.md) | 问题分析与调研（Claude Docs 导出，rev 37）：问题本质、StreamEdit 机制、相关工作、创新点定位、可证伪假设与实验计划、实验中发现的问题（第 10 节） |
 | [work_summary_2026-10-07.md](work_summary_2026-10-07.md) | 截至 2026-10-07 的工作总结：相对原版的改动、各实验结果与数字、编辑记忆第一版及验证、已知局限、下一步 |
 | [prompts_used.md](prompts_used.md) | 已跑实验用到的完整 prompt |
+| [mask_propagation_2026-10-11.md](mask_propagation_2026-10-11.md) | mask 获取定稿：关键帧 SAM3 + 运动矢量传播（a16r1.15），依据与局限 |
 
 说明：
 
