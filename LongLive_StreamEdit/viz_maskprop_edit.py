@@ -111,7 +111,7 @@ if __name__ == "__main__":
     n = 0
     for c in json.load(open(f"{POOL}/edits.json")):
         for ek, e in c["edits"].items():
-            if ONLY and ONLY not in c["clip"] and ONLY != ek:
+            if (ONLY and ONLY not in c["clip"] and ONLY != ek) or c["clip"] not in meta:
                 continue
             n += render(c["clip"], ek, e, meta[c["clip"]])
     print(f"{n} comparison videos")
