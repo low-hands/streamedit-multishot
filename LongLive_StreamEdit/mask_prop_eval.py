@@ -10,6 +10,10 @@ Methods (all causal: frame t only uses frames <= t)
   mv     warp with codec motion vectors. The source is re-encoded P-frames only, 1 reference frame
          (x264 zerolatency, like a live stream), so every vector points to the previous frame
   dis    warp with OpenCV DIS optical flow (CPU, computed at --flow_scale resolution)
+  mvc    mv + cleanup: motion vectors median-filtered over --mv_median x 4 px cells (encoder vectors in flat
+         regions such as sky are arbitrary and drag the mask into them), and after every warp the mask keeps
+         only connected components >= --keep_frac x the largest one (fragments otherwise persist and grow)
+  disc   dis + the same component cleanup
 Schedules (keyframes are always placed at shot starts; cuts come from the manifest here)
   N      a keyframe every N frames (e.g. 12, 24, 48)
   shot   only at shot starts
@@ -217,6 +221,25 @@ def parse_schedule(s, area_ratio):
     return int(s), None
 
 
+def median_maps(maps, k):
+    """per-channel median over k x k cells of every motion-vector map."""
+    return np.stack([np.stack([cv2.medianBlur(np.ascontiguousarray(m[..., i]), k) for i in range(2)], -1)
+                     for m in maps])
+
+
+def clean(soft, keep_frac):
+    """drop connected components smaller than keep_frac x the largest one."""
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((soft > 0.5).astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return soft
+    area = stats[1:, cv2.CC_STAT_AREA]
+    drop = np.nonzero(area < keep_frac * area.max())[0] + 1
+    if len(drop):
+        soft = soft.copy()
+        soft[np.isin(lab, drop)] = 0
+    return soft
+
+
 def run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args):
     """Propagate; returns (pred bool [T, H, W], keyframe flags [T], ms/frame of propagation)."""
     max_gap, ratio = parse_schedule(schedule, args.area_ratio)
@@ -241,10 +264,13 @@ def run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args):
             key_area = ref[t].sum()
         elif t > 0:  # propagate frame t-1 -> t (shot starts are always keyframes, so never across a cut)
             t0 = time.perf_counter()
-            if method == "mv":
-                soft = warp(soft, cv2.resize(mv_maps[t], (W, H), interpolation=cv2.INTER_NEAREST))
-            elif method == "dis":
+            if method in ("mv", "mvc"):
+                maps = mv_maps["med"] if method == "mvc" else mv_maps["raw"]
+                soft = warp(soft, cv2.resize(maps[t], (W, H), interpolation=cv2.INTER_NEAREST))
+            elif method in ("dis", "disc"):
                 soft = warp(soft, flow(gray[t - 1], gray[t]))
+            if method in ("mvc", "disc"):
+                soft = clean(soft, args.keep_frac)
             ms += (time.perf_counter() - t0) * 1e3
         pred[t] = soft > 0.5
     n_prop = max(T - key.sum(), 1)
@@ -267,7 +293,10 @@ def evaluate(name, video, masks, shot_frames, args, ffmpeg):
     gray = load_gray(video, T)
     assert len(gray) == T, (len(gray), T)
     methods = args.methods.split(",")
-    mv_maps, mv_ms = load_mv_maps(video, T, ffmpeg) if "mv" in methods else (None, 0.0)
+    mv_maps, mv_ms = None, 0.0
+    if {"mv", "mvc"} & set(methods):
+        raw, mv_ms = load_mv_maps(video, T, ffmpeg)
+        mv_maps = {"raw": raw, "med": median_maps(raw, args.mv_median) if "mvc" in methods else None}
     flow = DIS(args.flow_scale, {"ultrafast": 0, "fast": 1, "medium": 2}[args.dis_preset])
     convert = to_latent_token_v0 if args.conv == "v0" else to_latent_token
     lat_ref, tok_ref, first = convert(ref, shot_frames)
@@ -282,7 +311,7 @@ def evaluate(name, video, masks, shot_frames, args, ffmpeg):
     for method in methods:
         for schedule in args.schedules.split(","):
             pred, key, ms = run(method, schedule, ref, shot_frames, gray, mv_maps, flow, args)
-            if method == "mv":
+            if method in ("mv", "mvc"):
                 ms += mv_ms
             if (method, schedule) in viz:
                 viz_runs[(method, schedule)] = (pred, key)
@@ -390,7 +419,8 @@ def summarize(results, out):
               f"{row['lat_iou']:8.3f} {row['px_iou']:7.3f} {row['sam_per_100f']:9.1f} {row['prop_ms']:6.2f}   {ds}")
     json.dump(summ, open(os.path.join(out, "summary.json"), "w"), indent=1)
 
-    cols = [k for k in (("hold", "12"), ("mv", "12"), ("dis", "12"), ("mv", "a48"), ("mv", "shot")) if k in rows]
+    cols = [k for k in (("hold", "12"), ("mv", "12"), ("mvc", "12"), ("dis", "12"), ("disc", "12"),
+                        ("mv", "a24r1.25"), ("mvc", "a24r1.25"), ("mv", "a48"), ("mv", "shot")) if k in rows]
     print(f"\n{'mask':48s} {'area%':>6s} {'tokens':>7s} {'ref_consec':>10s} " + " ".join(f"{m + ' ' + s:>9s}" for m, s in cols))
     for res in results:
         by = {(r["method"], r["schedule"]): r["tok_iou"] for r in res["runs"]}
@@ -437,6 +467,8 @@ def main():
     p.add_argument("--area_ratio", type=float, default=1.5, help="adaptive schedule: re-key outside [1/r, r]")
     p.add_argument("--flow_scale", type=float, default=0.5)
     p.add_argument("--dis_preset", choices=["ultrafast", "fast", "medium"], default="fast")
+    p.add_argument("--mv_median", type=int, default=5, help="mvc: median window in 4 px cells (3 or 5)")
+    p.add_argument("--keep_frac", type=float, default=0.2, help="mvc/disc: keep components >= this x largest")
     p.add_argument("--conv", choices=["v0", "v1"], default="v1", help="mask conversion used for the comparison")
     p.add_argument("--viz", default="", help="method:schedule panels for the overlay video, e.g. mv:12,dis:12,hold:12")
     p.add_argument("--viz_tokens", action="store_true", help="draw masks at 16 px token level")
