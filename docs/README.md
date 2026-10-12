@@ -6,6 +6,7 @@
 | [work_summary_2026-10-07.md](work_summary_2026-10-07.md) | 截至 2026-10-07 的工作总结：相对原版的改动、各实验结果与数字、编辑记忆第一版及验证、已知局限、下一步 |
 | [prompts_used.md](prompts_used.md) | 已跑实验用到的完整 prompt |
 | [mask_propagation_2026-10-11.md](mask_propagation_2026-10-11.md) | mask 获取定稿：关键帧 SAM3 + 运动矢量传播（a16r1.15），依据与局限 |
+| [memory_rethink_2026-10-12.md](memory_rethink_2026-10-12.md) | 编辑记忆方向复盘：之前思路的问题、新发现的并行工作（ContextMaster）、下一步要查清的三个事实及据此定方向的规则 |
 
 说明：
 
