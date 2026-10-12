@@ -162,13 +162,14 @@ Self-Forcing 和 LongLive 都只在单镜头连续片段上训练过。ShotStrea
 | --- | --- | --- | --- | --- | --- |
 | [StreamEdit](https://arxiv.org/abs/2605.21466)（2605.21466） | 编辑 | 是 | 否 | 滑动窗口 + sink；正文未提镜头切换 | 直接基线 |
 | [Closing the Loop](https://arxiv.org/abs/2607.21848)（2607.21848） | 生成式渲染 | 是 | 否 | 镜头回到旧位置时把匹配的历史 chunk 检索进 KV；用 3D 重投影对应在 attention logits 上加高斯偏置；检索 chunk 重新放到窗口旁的 RoPE 位置。底座 Causal Wan-VACE（Self-Forcing 蒸馏） | **挑战 ③ 最近的先例**；对应来自 3D 引擎 |
-| [Warp-as-History](https://arxiv.org/html/2605.15182)（2605.15182） | 相机控制生成 | 否 | 一段视频上 LoRA | 把过去帧 warp 成伪历史，赋予目标帧的 RoPE 位置，丢弃不可见 token | **"虚拟历史"的先例**；对应来自外部 3D 重建 |
+| [Warp-as-History](https://arxiv.org/html/2605.15182)（2605.15182） | 相机控制生成 | 否 | 冻结模型即可（zero-shot）；一段视频上的 LoRA 只用于稳定 | 把过去帧 warp 成伪历史，走模型原有的历史通道，位置编码与正在去噪的目标帧对齐，丢弃没有有效来源的 token；新露出的区域交给生成器补 | **"虚拟历史"的先例**，并说明冻结模型能读懂搬到当前几何上的历史；对应来自外部 3D 重建 |
 | [TetherMem](https://arxiv.org/abs/2608.26902)（2608.26902） | 长视频生成 | 是 | 否 | 主体 query 保留历史，场景 query 弱化旧背景；用区域和时间先验路由 | "记实体、不记场景"的生成版 |
 | [SlotMem](https://arxiv.org/abs/2607.15772)（2607.15772） | 叙事长视频生成 | 是 | 是 | 每个角色一个紧凑 slot；Memory Writer 保守更新；只注入到同一角色的 token | 挑战 ①② 的训练版先例 |
 | [IAMFlow](https://arxiv.org/abs/2605.18733)（2605.18733） | 叙事流式生成 | 是 | 否 | LLM 抽取实体并分配全局 ID，VLM 异步校验 | training-free 实体记忆；依赖外部大模型 |
 | [PermaVid](https://arxiv.org/abs/2606.16449)（2606.16449） | 带编辑操作的生成 | 是 | 是（Wan2.1-14B） | 外观（RGB）与几何（深度）分开存；编辑后使对应外观条目失效 | 外观与几何分离的先例 |
 | [MSEditor](https://arxiv.org/abs/2608.17559)（2608.17559） | 多镜头编辑 | 否 | 是（Wan2.1-14B） | Cross-Shot Packing | 离线上界参考 |
 | [Thinking on Shots / MMLVE](https://arxiv.org/abs/2608.26809)（2608.26809） | 多镜头编辑 | 否 | agent（LLM/VLM） | top-k 关键帧拼成参考图 | "多镜头编辑"本身已不新 |
+| [ContextMaster](https://arxiv.org/html/2608.04956v1)（2608.04956） | 交互式多镜头创作（文本生成、参考图生成、多镜头编辑统一） | 是（单卡 16 FPS） | 是（全上下文教师 → 稀疏学生的一致性蒸馏 + 分布匹配） | 观测上下文的 KV 每轮只预填一次；每个 query 读取量固定；ConstraintSink 固定保留参考图和时间对齐的源块，剩余额度按内容检索相关的源块和历史块 | **最接近的并行工作**：流式、多镜头、含编辑；但需训练，按内容检索而非用源对应重投影 |
 | [EditaLive](https://arxiv.org/html/2608.27123)（2608.27123） | 直播人物编辑 | 是（14.5 FPS） | 是 | 首帧作持久外观锚点（FPSA）+ sink + 固定 RoPE；未处理切镜头 | 场景最接近的训练式工作 |
 | [LiveEdit](https://arxiv.org/html/2606.26740v1)（2606.26740，ECCV 2026） | 流式编辑 | 是 | 是 | AR mask cache；未评测镜头切换 | 训练式基线 |
 | [JoyAI-Video-Edit](https://arxiv.org/html/2608.03974v1)（2608.03974） | 流式编辑 | 是 | 是（16B） | 滑动窗口 + 全局 sink | 开源，可验证通用性 |
@@ -189,6 +190,8 @@ Self-Forcing 和 LongLive 都只在单镜头连续片段上训练过。ShotStrea
 3. training-free 方案中，记忆 token 的位置编码问题没有被系统研究；训练式方案是靠训练（ShotStream、Anchor Forcing）绕开的。
 
 **2026-10 补充查新结论**："training-free + 流式 + 内容不连续 + 编辑"这个设定仍未见任何工作；所有流式编辑工作都需要训练且不处理切镜头。但我们的三个组件在生成方向上都有 2026 年的近似先例（Closing the Loop、Warp-as-History、TetherMem、SlotMem）。它们的对应关系都来自外部（3D 引擎、3D 重建、LLM/VLM）或人为先验；切镜头时 3D 对应不成立。
+
+**2026-10-12 补充**：[ContextMaster](https://arxiv.org/html/2608.04956v1)（2608.04956，8 月）已经做到流式、多镜头、包含编辑，单卡 16 FPS，跨镜头一致性优于专门方法。它需要训练，记忆按内容检索，没有用源视频提供跨镜头对应。影响："流式多镜头编辑"这个设定本身的新颖性下降，论文重心必须放在免训练和"冻结的连续模型能延续什么样的上下文"这个规律上，不能靠任务新。
 
 ## 6. 空白与定位
 
@@ -317,7 +320,7 @@ Self-Forcing 和 LongLive 都只在单镜头连续片段上训练过。ShotStrea
 
 | 风险 | 可能性 | 影响 | 应对 |
 | --- | --- | --- | --- |
-| 并行工作先发表"流式多镜头编辑" | 高：相邻方向几乎每月都有新工作 | 任务新颖性消失 | 贡献重心放在规律和三层编辑状态上，而不是任务本身 |
+| 并行工作先发表"流式多镜头编辑" | 高，已部分发生：ContextMaster（2608.04956，训练式）已覆盖流式多镜头编辑 | 任务新颖性消失 | 贡献重心放在规律和三层编辑状态上，而不是任务本身 |
 | 朴素扩展（加大窗口、塞原样记忆）已经够用 | 未知 | 核心原则不成立，创新空间很小 | E1 尽早回答 |
 | 创新单薄，被看作 TokenFlow + 视觉提示的组合 | 中 | 难上 A 会 | 按 6.3 节加厚：规律分析 + 丰富问题设定 |
 | 关键帧流水线一致性更高 | 中 | 审稿人质疑价值 | 用"一致性—代价"图和镜头中途不连续的场景说明 |
@@ -408,6 +411,12 @@ nogap 在缝里只给 attention 留出 1–2 个 token 的通道（仅 f170/f174
 - [Streaming Video Editing with Easy Adaptation (SVEET)](https://arxiv.org/abs/2609.24788)
 - [LongLive-2.0: An NVFP4 Parallel Infrastructure for Long Video Generation](https://arxiv.org/abs/2605.18739)
 - [LongLive-RAG: A General Retrieval-Augmented Framework for Long Video Generation](https://arxiv.org/abs/2606.02553)
+
+2026-10-12 补充（本环境无法打开 arxiv，以下只来自搜索摘要，未读全文）：
+
+- [ContextMaster: Interactive Multi-Shot Video Creation via Fixed-Budget Sparse Context Routing](https://arxiv.org/html/2608.04956v1)
+- Closing the Loop 补充细节：取回的 chunk 放在紧邻最近窗口的 RoPE 位置；高斯偏置只加在主分支 self-attention 中取回 chunk 的 key 上。是否有"不加偏置"的消融未确认
+- Warp-as-History 补充细节：冻结模型 zero-shot 即可跟随相机轨迹，LoRA 只起稳定作用；具体如何改时间位置未确认
 - [Edit Transfer: Learning Image Editing via Vision In-Context Relations](https://arxiv.org/abs/2503.13327)
 - [Learn Once, Edit Anywhere: Visual Direction Transfer for Diffusion Models (ViDiT)](https://arxiv.org/html/2403.19645)
 - [I2VEdit: First-Frame-Guided Video Editing via Image-to-Video Diffusion Models](https://arxiv.org/abs/2405.16537)
