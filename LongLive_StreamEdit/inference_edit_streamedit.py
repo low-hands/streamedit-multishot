@@ -185,6 +185,10 @@ def build_parser():
     parser.add_argument("--shot_frames", type=str, default=None,
                         help="E0: comma-separated frames per shot (each 12k-3). Encodes/decodes each shot "
                              "separately and derives the cut chunks. Unset = stock behaviour.")
+    parser.add_argument("--detect_cuts", action="store_true", default=False,
+                        help="detect hard cuts on the whole source when it is loaded (I-frames of an x264 "
+                             "re-encode, stream_cut.codec_cuts), pad every shot to 12k-3 frames with its last "
+                             "frame (and mask), edit per shot, drop the padded frames. Replaces --shot_frames.")
     parser.add_argument("--reset_at_cut", choices=["none", "all", "keep_sink"], default="none")
     parser.add_argument("--oracle_mask", type=str, default=None,
                         help="E0: npz with `masks` bool [T,H,W] (source video) replacing cross-attn grounding")
@@ -225,6 +229,12 @@ def setup(args):
     return pipeline, low_memory, device, local_rank
 
 
+def _load_oracle(path, new_len, pad_idx=None):
+    """per-frame source masks; with --detect_cuts re-indexed onto the padded frames."""
+    m = np.load(path)["masks"]
+    return m[pad_idx] if pad_idx is not None else m[:new_len]
+
+
 def edit_one(args, pipeline, low_memory, device, local_rank):
     # Create output directory (only on main process to avoid race conditions)
     if local_rank == 0:
@@ -246,6 +256,22 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
     width = src_video[0].size[0]
     num_frames = len(src_video)
     shot_frames = [int(x) for x in args.shot_frames.split(",")] if args.shot_frames else None
+    pad_idx, keep_out = None, None  # ✨ --detect_cuts: padded frame -> source frame, output frames to keep
+    if args.detect_cuts:
+        import imageio_ffmpeg
+        from stream_cut import codec_cuts
+        cuts = codec_cuts(args.data_path, imageio_ffmpeg.get_ffmpeg_exe(), num_frames)
+        shots = np.diff([0] + cuts + [num_frames]).astype(int).tolist()
+        shot_frames, pad_idx, keep_out, _s = [], [], [], 0
+        for _n in shots:
+            _N = max(9, 12 * -(-(_n + 3) // 12) - 3)  # smallest 12m - 3 >= n
+            keep_out += list(range(len(pad_idx), len(pad_idx) + _n))
+            pad_idx += list(range(_s, _s + _n)) + [_s + _n - 1] * (_N - _n)
+            shot_frames.append(_N)
+            _s += _n
+        src_video = [src_video[i] for i in pad_idx]
+        num_frames = len(src_video)
+        print(f"detected cuts {cuts}: shots {shots} -> padded {shot_frames} (+{num_frames - len(keep_out)} frames)")
     if shot_frames:
         assert all((n + 3) % 12 == 0 for n in shot_frames), f"each shot must be 12k-3 frames: {shot_frames}"
         assert sum(shot_frames) <= num_frames, (sum(shot_frames), num_frames)
@@ -289,7 +315,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
     oracle_latent_masks = None
     if args.oracle_mask and args.oracle_version == "v1":
         assert shot_frames, "--oracle_mask needs --shot_frames"
-        _mb = np.load(args.oracle_mask)["masks"][:new_len].astype(bool).copy()
+        _mb = _load_oracle(args.oracle_mask, new_len, pad_idx).astype(bool).copy()
         assert _mb.shape[0] == new_len, (_mb.shape, new_len)
         _s, _fixed = 0, 0
         for _n in shot_frames:  # causal glitch filter, restarted at every cut
@@ -342,7 +368,7 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
               f"latent coverage={oracle_latent_masks.float().mean():.3f}")
     elif args.oracle_mask:
         assert shot_frames, "--oracle_mask needs --shot_frames (latent/frame mapping restarts per shot)"
-        _m = torch.from_numpy(np.load(args.oracle_mask)["masks"][:new_len]).float()
+        _m = torch.from_numpy(_load_oracle(args.oracle_mask, new_len, pad_idx)).float()
         assert _m.shape[0] == new_len, (_m.shape, new_len)
         _toks, _s = [], 0
         for _n in shot_frames:
@@ -425,6 +451,8 @@ def edit_one(args, pipeline, low_memory, device, local_rank):
         vids.append((_v * 0.5 + 0.5).clamp(0, 1))
         _s += _l
     edit_video = torch.cat(vids, dim=1)
+    if keep_out is not None:  # ✨ --detect_cuts: drop the padded frames
+        edit_video = edit_video[:, keep_out]
     torch.cuda.synchronize(); _t_dec = time.perf_counter() - _t_dec0
     _tm = getattr(pipeline, "timing", None) or {}
     timing = {"frames": int(edit_video.shape[1]), "encode_s": _t_enc, "inference_s": _t_inf,
